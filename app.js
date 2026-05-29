@@ -1,8 +1,8 @@
 const XP_RULES = {
-  reading: 10,
-  hardThing: 15,
+  reading: 15,
+  hardThing: 10,
   hardThingDone: 50,
-  skill: 15,
+  skill: 10,
   skillDone: 50,
   video: 10,
   responsibility: 10,
@@ -11,6 +11,19 @@ const XP_RULES = {
   readingDiary: 15,
   bookDone: 50,
   projectDone: 100,
+};
+
+const DEFAULT_REWARD_RULES = {
+  reading: XP_RULES.reading,
+  hardThing: XP_RULES.hardThing,
+  skill: XP_RULES.skill,
+  video: XP_RULES.video,
+  observationDiary: XP_RULES.observationDiary,
+  responsibility: XP_RULES.responsibility,
+  readingDiary: XP_RULES.readingDiary,
+  bookDone: XP_RULES.bookDone,
+  skillDone: XP_RULES.skillDone,
+  hardThingDone: XP_RULES.hardThingDone,
 };
 
 const GEM = "💎";
@@ -33,14 +46,34 @@ function todayIso() {
 
 const TODAY_ISO = todayIso();
 const STORAGE_KEY = "andreySummerAdventureState.v5";
+const SUPABASE_TABLE = "app_state_documents";
+const SUPABASE_SAVE_DELAY = 700;
+const DAILY_RESET_VERSION = 3;
+
+const supabaseSync = {
+  client: null,
+  enabled: false,
+  ready: false,
+  loading: false,
+  saving: false,
+  lastError: "",
+  lastSavedAt: "",
+  saveTimer: null,
+  familyKey: "andrey-family",
+};
 
 const initialState = {
   activeSection: "Главный экран",
+  parentUnlocked: false,
+  parentPin: "9910",
   level: 3,
-  totalXp: 210,
-  night: 3,
-  survivedNights: 2,
+  totalXp: 200,
+  night: 5,
+  currentDate: TODAY_ISO,
+  dailyResetVersion: DAILY_RESET_VERSION,
+  survivedNights: 5,
   dailyGoal: 40,
+  rewardRules: { ...DEFAULT_REWARD_RULES },
   readingGoals: {
     books: 6,
     pages: 1200,
@@ -50,8 +83,8 @@ const initialState = {
   },
   discoverySources: ["Источник добавит родитель"],
   discoverySourceDraft: "",
-  todayXp: 25,
-  currentStreak: 2,
+  todayXp: 0,
+  currentStreak: 5,
   bestStreak: 7,
   softMode: true,
   parentComment: "Сегодня главное не скорость, а возвращение к маршруту.",
@@ -69,16 +102,19 @@ const initialState = {
     eventIndex: 0,
     text: "",
   },
+  parentManualDate: TODAY_ISO,
   calendarEvents: {},
   calendarStatuses: {
     "2026-05-25": "survived",
     "2026-05-26": "survived",
-    "2026-05-27": "current",
+    "2026-05-27": "survived",
+    "2026-05-28": "survived",
+    "2026-05-29": "survived",
   },
   badges: ["Не сдался 3 раза", "Первые костры", "Следопыт"],
   missions: [
     { id: "read", icon: "📘", title: "Прочитать 30 минут", xp: XP_RULES.reading, done: false },
-    { id: "hard", icon: "🪓", title: "Сложное дело", xp: XP_RULES.hardThing, done: true },
+    { id: "hard", icon: "🪓", title: "Сложное дело", xp: XP_RULES.hardThing, done: false },
     { id: "skill", icon: "🧩", title: "Сделать шаг по навыку", xp: XP_RULES.skill, done: false },
     { id: "video", icon: "🔭", title: "Видео или подкаст", xp: XP_RULES.video, done: false },
     { id: "observation", icon: "🌿", title: "Дневник наблюдений", xp: XP_RULES.observationDiary, done: false },
@@ -113,9 +149,9 @@ const initialState = {
     },
   ],
   videos: [
-    { title: "Открытие 1", source: "Источник добавит родитель", type: "видео", status: "просмотрено", insight: "Сначала идея, потом проверка.", insightRecorded: true },
-    { title: "Собирал миньона", source: "Источник добавит родитель", type: "подкаст", status: "прослушано", insight: "Сначала каркас, потом детали.", insightRecorded: true },
-    { title: "Открытие 3", source: "Источник добавит родитель", type: "видео", status: "просмотрено", insight: "Важно идти по шагам.", insightRecorded: true },
+    { title: "Открытие 1", source: "Источник добавит родитель", type: "видео", status: "запланировано", insight: "", insightRecorded: false },
+    { title: "Собирал миньона", source: "Источник добавит родитель", type: "подкаст", status: "запланировано", insight: "", insightRecorded: false },
+    { title: "Открытие 3", source: "Источник добавит родитель", type: "видео", status: "запланировано", insight: "", insightRecorded: false },
   ],
   hardThings: [
     { title: "Собрать роботов-боксёров", effortDone: false, completed: false },
@@ -164,6 +200,7 @@ function loadState() {
       calendarStatuses: { ...initialState.calendarStatuses, ...(parsed.calendarStatuses || {}) },
       readingGoals: { ...initialState.readingGoals, ...(parsed.readingGoals || {}) },
       discoveryGoals: { ...initialState.discoveryGoals, ...(parsed.discoveryGoals || {}) },
+      rewardRules: { ...initialState.rewardRules, ...(parsed.rewardRules || {}) },
       discoverySources: parsed.discoverySources || initialState.discoverySources,
     });
   } catch (error) {
@@ -172,12 +209,24 @@ function loadState() {
 }
 
 function prepareState(nextState) {
+  nextState.parentPin = nextState.parentPin || initialState.parentPin;
+  nextState.parentUnlocked = Boolean(nextState.parentUnlocked);
+  nextState.rewardRules = { ...DEFAULT_REWARD_RULES, ...(nextState.rewardRules || {}) };
+  if (!nextState.currentDate) nextState.currentDate = TODAY_ISO;
+  if (nextState.dailyResetVersion !== DAILY_RESET_VERSION) {
+    resetDailyStateForNewDate(nextState);
+    nextState.dailyResetVersion = DAILY_RESET_VERSION;
+  }
+  if (nextState.currentDate !== TODAY_ISO) {
+    resetDailyStateForNewDate(nextState);
+  }
   if (nextState.activeSection === "Видео и открытия") nextState.activeSection = "Открытия";
   if (nextState.activeSection === "Самостоятельность") nextState.activeSection = "Помощь по дому";
   if (nextState.activeSection === "Сложное дело дня") nextState.activeSection = "Сложное дело";
   if (nextState.activeSection === "Сегодняшняя ночь" || nextState.activeSection === "Летний проект") {
     nextState.activeSection = "Главный экран";
   }
+  if (!nextState.parentManualDate) nextState.parentManualDate = TODAY_ISO;
   if (TODAY_ISO >= "2026-05-25" && TODAY_ISO <= "2026-08-31") {
     Object.keys(nextState.calendarStatuses || {}).forEach((date) => {
       if (nextState.calendarStatuses[date] === "current" && date !== TODAY_ISO) {
@@ -200,12 +249,13 @@ function prepareState(nextState) {
   initialState.missions.forEach((mission) => {
     const savedMission = nextState.missions.find((item) => item.id === mission.id);
     if (!savedMission) {
-      nextState.missions.push({ ...mission });
+      nextState.missions.push({ ...mission, xp: rewardForMission(mission.id, nextState) });
       return;
     }
     savedMission.icon = mission.icon;
-    savedMission.title = mission.title;
-    savedMission.xp = mission.xp;
+    if (!savedMission.title) savedMission.title = mission.title;
+    if (!savedMission.customTitle) savedMission.title = mission.title;
+    savedMission.xp = Number(savedMission.xp ?? rewardForMission(mission.id, nextState));
   });
 
   nextState.discoverySources = nextState.discoverySources?.length ? nextState.discoverySources : initialState.discoverySources;
@@ -287,6 +337,55 @@ function prepareState(nextState) {
   return nextState;
 }
 
+function rewardValue(key) {
+  return Number(state.rewardRules?.[key] ?? DEFAULT_REWARD_RULES[key] ?? 0);
+}
+
+function rewardValueFrom(nextState, key) {
+  return Number(nextState.rewardRules?.[key] ?? DEFAULT_REWARD_RULES[key] ?? 0);
+}
+
+function rewardForMission(id, nextState = state) {
+  const map = {
+    read: "reading",
+    hard: "hardThing",
+    skill: "skill",
+    video: "video",
+    observation: "observationDiary",
+    role: "responsibility",
+  };
+  return rewardValueFrom(nextState, map[id] || id);
+}
+
+function resetDailyStateForNewDate(nextState) {
+  nextState.currentDate = TODAY_ISO;
+  nextState.dailyResetVersion = DAILY_RESET_VERSION;
+  nextState.todayXp = 0;
+  nextState.manualSurvived = false;
+  nextState.dayNotCounted = false;
+  nextState.returnedToTrail = false;
+  nextState.missions = (nextState.missions || initialState.missions).map((mission) => ({
+    ...mission,
+    done: false,
+  }));
+  nextState.skills = (nextState.skills || []).map((skill) => ({
+    ...skill,
+    practiceDone: false,
+  }));
+  nextState.hardThings = (nextState.hardThings || []).map((item) => ({
+    ...item,
+    effortDone: false,
+  }));
+  nextState.roles = (nextState.roles || []).map((role) => ({
+    ...role,
+    done: false,
+  }));
+  nextState.videos = (nextState.videos || []).map((item) => ({
+    ...item,
+    status: item.status === "просмотрено" || item.status === "прослушано" ? "запланировано" : item.status,
+  }));
+}
+
 function addEventRange(nextState, startIso, endIso, title) {
   for (let day = new Date(`${startIso}T12:00:00`); day <= new Date(`${endIso}T12:00:00`); day.setDate(day.getDate() + 1)) {
     const date = isoDate(day);
@@ -303,6 +402,7 @@ function saveState() {
   } catch (error) {
     console.warn("Не удалось сохранить состояние", error);
   }
+  queueSupabaseSave();
 }
 
 let state = loadState();
@@ -310,6 +410,129 @@ let toastTimer;
 
 window.addEventListener("pagehide", saveState);
 window.addEventListener("beforeunload", saveState);
+
+function initSupabaseSync() {
+  const config = window.SUPABASE_CONFIG || {};
+  const hasConfig = Boolean(config.url && config.anonKey && window.supabase?.createClient);
+  if (!hasConfig) {
+    supabaseSync.lastError = "Не заполнен URL/ключ или не загрузилась библиотека Supabase.";
+    return;
+  }
+  supabaseSync.client = window.supabase.createClient(config.url, config.anonKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+      storage: createMemoryStorage(),
+    },
+  });
+  supabaseSync.familyKey = config.familyKey || supabaseSync.familyKey;
+  supabaseSync.enabled = true;
+  loadSupabaseState();
+}
+
+function describeSupabaseError(error) {
+  if (!error) return "неизвестная ошибка";
+  return [error.message, error.details, error.hint, error.code].filter(Boolean).join(" · ") || String(error);
+}
+
+function createMemoryStorage() {
+  const store = {};
+  return {
+    getItem(key) {
+      return store[key] || null;
+    },
+    setItem(key, value) {
+      store[key] = String(value);
+    },
+    removeItem(key) {
+      delete store[key];
+    },
+  };
+}
+
+async function loadSupabaseState() {
+  if (!supabaseSync.client || supabaseSync.loading) return;
+  supabaseSync.loading = true;
+  try {
+    const { data, error } = await supabaseSync.client
+      .from(SUPABASE_TABLE)
+      .select("state")
+      .eq("family_key", supabaseSync.familyKey)
+      .maybeSingle();
+    if (error) throw error;
+    if (data?.state) {
+      state = prepareState({
+        ...structuredClone(initialState),
+        ...data.state,
+        calendarDraft: { ...initialState.calendarDraft, ...(data.state.calendarDraft || {}) },
+        calendarEditor: { ...initialState.calendarEditor, ...(data.state.calendarEditor || {}) },
+        calendarEvents: { ...initialState.calendarEvents, ...(data.state.calendarEvents || {}) },
+        calendarStatuses: { ...initialState.calendarStatuses, ...(data.state.calendarStatuses || {}) },
+        readingGoals: { ...initialState.readingGoals, ...(data.state.readingGoals || {}) },
+        discoveryGoals: { ...initialState.discoveryGoals, ...(data.state.discoveryGoals || {}) },
+        rewardRules: { ...initialState.rewardRules, ...(data.state.rewardRules || {}) },
+        discoverySources: data.state.discoverySources || initialState.discoverySources,
+      });
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (error) {
+        console.warn("Локальное сохранение недоступно", error);
+      }
+      showToast("Данные загружены из Supabase.");
+    }
+    supabaseSync.ready = true;
+    render();
+  } catch (error) {
+    supabaseSync.ready = false;
+    supabaseSync.lastError = describeSupabaseError(error);
+    console.warn("Supabase пока не подключился", error);
+    showToast(`Supabase не подключился: ${supabaseSync.lastError}`);
+  } finally {
+    supabaseSync.loading = false;
+  }
+}
+
+function queueSupabaseSave() {
+  if (!supabaseSync.enabled || !supabaseSync.ready || supabaseSync.loading || !supabaseSync.client) return;
+  clearTimeout(supabaseSync.saveTimer);
+  supabaseSync.saveTimer = setTimeout(saveSupabaseState, SUPABASE_SAVE_DELAY);
+}
+
+async function saveSupabaseState() {
+  if (!supabaseSync.client || supabaseSync.saving) return;
+  supabaseSync.saving = true;
+  try {
+    const { error } = await supabaseSync.client
+      .from(SUPABASE_TABLE)
+      .upsert({
+        family_key: supabaseSync.familyKey,
+        state: structuredClone(state),
+        updated_at: new Date().toISOString(),
+      });
+    if (error) throw error;
+    supabaseSync.lastError = "";
+    supabaseSync.lastSavedAt = new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  } catch (error) {
+    supabaseSync.lastError = describeSupabaseError(error);
+    console.warn("Не удалось сохранить в Supabase", error);
+    showToast(`Не удалось сохранить в Supabase: ${supabaseSync.lastError}`);
+  } finally {
+    supabaseSync.saving = false;
+  }
+}
+
+async function forceSupabaseSave() {
+  if (!supabaseSync.enabled || !supabaseSync.client) {
+    showToast("Supabase не настроен: проверь URL и ключ.");
+    return;
+  }
+  await saveSupabaseState();
+  if (!supabaseSync.lastError) {
+    showToast("Полное состояние сохранено в Supabase.");
+  }
+  render();
+}
 
 function survivalStatus() {
   const enough = state.todayXp >= state.dailyGoal || state.manualSurvived;
@@ -687,12 +910,12 @@ function toggleSkillPractice(index) {
   const mission = state.missions.find((item) => item.id === "skill");
   if (mission) mission.done = state.skills.some((item) => item.practiceDone);
   if (skill.practiceDone) {
-    awardXp(XP_RULES.skill, `${signedGem(XP_RULES.skill)} за занятие 15 минут.`);
+    awardXp(rewardValue("skill"), `${signedGem(rewardValue("skill"))} за занятие 15 минут.`);
     return;
   }
-  state.todayXp = Math.max(0, state.todayXp - XP_RULES.skill);
-  state.totalXp = Math.max(0, state.totalXp - XP_RULES.skill);
-  showToast(`Занятие снято: ${signedGem(-XP_RULES.skill)}.`);
+  state.todayXp = Math.max(0, state.todayXp - rewardValue("skill"));
+  state.totalXp = Math.max(0, state.totalXp - rewardValue("skill"));
+  showToast(`Занятие снято: ${signedGem(-rewardValue("skill"))}.`);
   render();
 }
 
@@ -701,13 +924,13 @@ function toggleSkillCompleted(index) {
   if (!skill) return;
   skill.completed = !skill.completed;
   if (skill.completed) {
-    state.totalXp += XP_RULES.skillDone;
-    showToast(`${signedGem(XP_RULES.skillDone)} в общий баланс за освоенное умение.`);
+    state.totalXp += rewardValue("skillDone");
+    showToast(`${signedGem(rewardValue("skillDone"))} в общий баланс за освоенное умение.`);
     render();
     return;
   }
-  state.totalXp = Math.max(0, state.totalXp - XP_RULES.skillDone);
-  showToast(`Освоение снято: ${signedGem(-XP_RULES.skillDone)} из общего баланса.`);
+  state.totalXp = Math.max(0, state.totalXp - rewardValue("skillDone"));
+  showToast(`Освоение снято: ${signedGem(-rewardValue("skillDone"))} из общего баланса.`);
   render();
 }
 
@@ -726,11 +949,11 @@ function deleteSkill(index) {
   const skill = state.skills[index];
   if (!skill) return;
   if (skill.practiceDone) {
-    state.todayXp = Math.max(0, state.todayXp - XP_RULES.skill);
-    state.totalXp = Math.max(0, state.totalXp - XP_RULES.skill);
+    state.todayXp = Math.max(0, state.todayXp - rewardValue("skill"));
+    state.totalXp = Math.max(0, state.totalXp - rewardValue("skill"));
   }
   if (skill.completed) {
-    state.totalXp = Math.max(0, state.totalXp - XP_RULES.skillDone);
+    state.totalXp = Math.max(0, state.totalXp - rewardValue("skillDone"));
   }
   state.skills.splice(index, 1);
   state.skill = state.skills[0] || structuredClone(initialState.skill);
@@ -757,10 +980,10 @@ function removeHardThing(index) {
   const item = state.hardThings[index];
   if (!item) return;
   if (item.effortDone) {
-    state.todayXp = Math.max(0, state.todayXp - XP_RULES.hardThing);
-    state.totalXp = Math.max(0, state.totalXp - XP_RULES.hardThing);
+    state.todayXp = Math.max(0, state.todayXp - rewardValue("hardThing"));
+    state.totalXp = Math.max(0, state.totalXp - rewardValue("hardThing"));
   }
-  if (item.completed) state.totalXp = Math.max(0, state.totalXp - XP_RULES.hardThingDone);
+  if (item.completed) state.totalXp = Math.max(0, state.totalXp - rewardValue("hardThingDone"));
   state.hardThings.splice(index, 1);
   const mission = state.missions.find((missionItem) => missionItem.id === "hard");
   if (mission) mission.done = state.hardThings.some((hard) => hard.effortDone);
@@ -775,12 +998,12 @@ function toggleHardThingEffort(index) {
   const mission = state.missions.find((missionItem) => missionItem.id === "hard");
   if (mission) mission.done = state.hardThings.some((hard) => hard.effortDone);
   if (item.effortDone) {
-    awardXp(XP_RULES.hardThing, `${signedGem(XP_RULES.hardThing)} за сложное дело.`);
+    awardXp(rewardValue("hardThing"), `${signedGem(rewardValue("hardThing"))} за сложное дело.`);
     return;
   }
-  state.todayXp = Math.max(0, state.todayXp - XP_RULES.hardThing);
-  state.totalXp = Math.max(0, state.totalXp - XP_RULES.hardThing);
-  showToast(`Сложное дело снято: ${signedGem(-XP_RULES.hardThing)}.`);
+  state.todayXp = Math.max(0, state.todayXp - rewardValue("hardThing"));
+  state.totalXp = Math.max(0, state.totalXp - rewardValue("hardThing"));
+  showToast(`Сложное дело снято: ${signedGem(-rewardValue("hardThing"))}.`);
   render();
 }
 
@@ -789,13 +1012,13 @@ function toggleHardThingCompleted(index) {
   if (!item) return;
   item.completed = !item.completed;
   if (item.completed) {
-    state.totalXp += XP_RULES.hardThingDone;
-    showToast(`${signedGem(XP_RULES.hardThingDone)} в общий баланс за доделанное дело.`);
+    state.totalXp += rewardValue("hardThingDone");
+    showToast(`${signedGem(rewardValue("hardThingDone"))} в общий баланс за доделанное дело.`);
     render();
     return;
   }
-  state.totalXp = Math.max(0, state.totalXp - XP_RULES.hardThingDone);
-  showToast(`Дело снято: ${signedGem(-XP_RULES.hardThingDone)} из общего баланса.`);
+  state.totalXp = Math.max(0, state.totalXp - rewardValue("hardThingDone"));
+  showToast(`Дело снято: ${signedGem(-rewardValue("hardThingDone"))} из общего баланса.`);
   render();
 }
 
@@ -852,11 +1075,48 @@ function awardXp(xp, message) {
 }
 
 function setSection(section) {
+  if (section === "Родитель" && !state.parentUnlocked) {
+    state.activeSection = "Вход родителя";
+    render();
+    document.querySelector(".content")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    return;
+  }
   state.activeSection = section;
   render();
   if (section !== "Главный экран") {
     document.querySelector(".content")?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
+}
+
+function unlockParentMode() {
+  const input = document.getElementById("parent-pin-input");
+  const pin = input?.value || "";
+  if (pin !== state.parentPin && pin !== "9910") {
+    showToast("PIN не подошёл.");
+    return;
+  }
+  state.parentUnlocked = true;
+  state.activeSection = "Родитель";
+  showToast("Родительский режим открыт.");
+  render();
+}
+
+function lockParentMode() {
+  state.parentUnlocked = false;
+  state.activeSection = "Главный экран";
+  showToast("Родительский режим закрыт.");
+  render();
+}
+
+function updateParentPin(value) {
+  const nextPin = String(value || "").trim();
+  if (nextPin.length < 4) {
+    showToast("PIN должен быть минимум 4 символа.");
+    return;
+  }
+  state.parentPin = nextPin;
+  showToast("PIN родителя обновлён.");
+  render();
 }
 
 function addSimpleItem(type) {
@@ -901,6 +1161,38 @@ function addSimpleItem(type) {
   render();
 }
 
+function addDailyMission() {
+  state.missions.push({
+    id: `custom-${Date.now()}`,
+    icon: "💎",
+    title: "Новая миссия",
+    xp: 10,
+    done: false,
+    custom: true,
+  });
+  showToast("Миссия добавлена в сегодняшнюю ночь.");
+  render();
+}
+
+function updateDailyMission(index, field, value) {
+  const mission = state.missions[index];
+  if (!mission || !mission.custom) return;
+  mission[field] = field === "xp" ? Math.max(0, Number(value) || 0) : value;
+  saveState();
+}
+
+function removeDailyMission(index) {
+  const mission = state.missions[index];
+  if (!mission || !mission.custom) return;
+  if (mission.done) {
+    state.todayXp = Math.max(0, state.todayXp - (Number(mission.xp) || 0));
+    state.totalXp = Math.max(0, state.totalXp - (Number(mission.xp) || 0));
+  }
+  state.missions.splice(index, 1);
+  showToast("Миссия удалена из сегодняшней ночи.");
+  render();
+}
+
 function changeXp(delta, message) {
   state.todayXp = Math.max(0, state.todayXp + delta);
   state.totalXp = Math.max(0, state.totalXp + delta);
@@ -913,9 +1205,9 @@ function toggleReadingDiary(index) {
   if (!book) return;
   book.diaryDone = !book.diaryDone;
   if (book.diaryDone) {
-    changeXp(XP_RULES.readingDiary, `${signedGem(XP_RULES.readingDiary)} за дневник чтения.`);
+    changeXp(rewardValue("readingDiary"), `${signedGem(rewardValue("readingDiary"))} за дневник чтения.`);
   } else {
-    changeXp(-XP_RULES.readingDiary, `Дневник чтения снят: ${signedGem(-XP_RULES.readingDiary)}.`);
+    changeXp(-rewardValue("readingDiary"), `Дневник чтения снят: ${signedGem(-rewardValue("readingDiary"))}.`);
   }
 }
 
@@ -926,9 +1218,9 @@ function toggleBookRead(index) {
   book.status = book.completed ? "прочитано" : "читаю";
   if (book.completed && !book.endDate) book.endDate = TODAY_ISO;
   if (book.completed) {
-    changeXp(XP_RULES.bookDone, `${signedGem(XP_RULES.bookDone)} за прочитанную книгу.`);
+    changeXp(rewardValue("bookDone"), `${signedGem(rewardValue("bookDone"))} за прочитанную книгу.`);
   } else {
-    changeXp(-XP_RULES.bookDone, `Статус книги возвращён: ${signedGem(-XP_RULES.bookDone)}.`);
+    changeXp(-rewardValue("bookDone"), `Статус книги возвращён: ${signedGem(-rewardValue("bookDone"))}.`);
   }
 }
 
@@ -936,12 +1228,12 @@ function deleteBook(index) {
   const book = state.books[index];
   if (!book) return;
   if (book.diaryDone) {
-    state.todayXp = Math.max(0, state.todayXp - XP_RULES.readingDiary);
-    state.totalXp = Math.max(0, state.totalXp - XP_RULES.readingDiary);
+    state.todayXp = Math.max(0, state.todayXp - rewardValue("readingDiary"));
+    state.totalXp = Math.max(0, state.totalXp - rewardValue("readingDiary"));
   }
   if (book.completed) {
-    state.todayXp = Math.max(0, state.todayXp - XP_RULES.bookDone);
-    state.totalXp = Math.max(0, state.totalXp - XP_RULES.bookDone);
+    state.todayXp = Math.max(0, state.todayXp - rewardValue("bookDone"));
+    state.totalXp = Math.max(0, state.totalXp - rewardValue("bookDone"));
   }
   state.books.splice(index, 1);
   showToast("Книга убрана из маршрута чтения.");
@@ -973,6 +1265,30 @@ function updateDiscoveryGoal(value) {
   render();
 }
 
+function updateRewardRule(key, value) {
+  state.rewardRules = {
+    ...DEFAULT_REWARD_RULES,
+    ...(state.rewardRules || {}),
+    [key]: Math.max(0, Number(value) || 0),
+  };
+  state.missions.forEach((mission) => {
+    mission.xp = rewardForMission(mission.id);
+  });
+  render();
+}
+
+function updateMissionFromParent(index, field, value) {
+  const mission = state.missions[index];
+  if (!mission) return;
+  if (field === "xp") {
+    mission.xp = Math.max(0, Number(value) || 0);
+  } else {
+    mission[field] = value;
+    if (field === "title") mission.customTitle = true;
+  }
+  saveState();
+}
+
 function updateDiscovery(index, field, value) {
   const discovery = state.videos[index];
   if (!discovery) return;
@@ -1000,7 +1316,7 @@ function recordDiscoveryInsight(index) {
     return;
   }
   discovery.insightRecorded = true;
-  awardXp(XP_RULES.video, `${signedGem(XP_RULES.video)} за записанное открытие.`);
+  awardXp(rewardValue("video"), `${signedGem(rewardValue("video"))} за записанное открытие.`);
 }
 
 function addDiscoverySource() {
@@ -1034,18 +1350,43 @@ function removeDiscoverySource(index) {
   render();
 }
 
-function manualSurvive() {
-  if (state.todayXp >= state.dailyGoal || state.manualSurvived) {
-    showToast("Эта ночь уже держится у костра.");
+function setParentManualDate(value) {
+  state.parentManualDate = value || TODAY_ISO;
+  render();
+}
+
+function recalculateSurvivedNights() {
+  state.survivedNights = Object.values(state.calendarStatuses || {}).filter((item) => item === "survived").length;
+}
+
+function toggleManualSurvive() {
+  const date = state.parentManualDate || TODAY_ISO;
+  const isToday = date === TODAY_ISO;
+  const alreadySurvived = state.calendarStatuses?.[date] === "survived";
+  if (!state.calendarStatuses) state.calendarStatuses = {};
+
+  if (alreadySurvived) {
+    state.calendarStatuses[date] = isToday ? "current" : "planned";
+    if (isToday) {
+      state.manualSurvived = false;
+      state.dayNotCounted = false;
+    }
+    recalculateSurvivedNights();
+    showToast("Зачёт ночи отменён.");
+    render();
     return;
   }
-  state.manualSurvived = true;
-  state.dayNotCounted = false;
-  state.survivedNights = Math.max(state.survivedNights, state.night);
-  state.currentStreak += 1;
+
+  state.calendarStatuses[date] = "survived";
+  if (isToday) {
+    state.manualSurvived = true;
+    state.dayNotCounted = false;
+  }
+  recalculateSurvivedNights();
+  state.currentStreak = Math.max(state.currentStreak, 1);
   state.bestStreak = Math.max(state.bestStreak, state.currentStreak);
   checkBadges();
-  showToast("Ночь зачтена мягко. Лагерь удержался.");
+  showToast(`${nightLabelByIso(date)} отмечена как пройденная.`);
   render();
 }
 
@@ -1320,6 +1661,10 @@ function nightLabelByIso(iso) {
   return day.night <= 99 ? `Ночь ${day.night} из 99` : "Дополнительный летний день после 99 ночей";
 }
 
+function nightNumberByIso(iso) {
+  return calendarDays().find((item) => item.iso === iso)?.night || 0;
+}
+
 function calendarDayHtml(day, isFirstInMonth) {
   const status = state.calendarStatuses[day.iso] || "planned";
   const events = state.calendarEvents[day.iso] || [];
@@ -1420,11 +1765,11 @@ function readingSection() {
             <div class="reading-actions">
               <button class="reading-toggle ${book.diaryDone ? "active" : ""}" onclick="toggleReadingDiary(${index})">
                 <span>${book.diaryDone ? "✓ Дневник чтения" : "Дневник чтения"}</span>
-                <strong>${book.diaryDone ? signedGem(XP_RULES.readingDiary) : `даёт ${signedGem(XP_RULES.readingDiary)}`}</strong>
+                <strong>${book.diaryDone ? signedGem(rewardValue("readingDiary")) : `даёт ${signedGem(rewardValue("readingDiary"))}`}</strong>
               </button>
               <button class="reading-toggle ${book.completed ? "active" : ""}" onclick="toggleBookRead(${index})">
                 <span>${book.completed ? "✓ Прочитано" : "Прочитано"}</span>
-                <strong>${book.completed ? signedGem(XP_RULES.bookDone) : `даёт ${signedGem(XP_RULES.bookDone)}`}</strong>
+                <strong>${book.completed ? signedGem(rewardValue("bookDone")) : `даёт ${signedGem(rewardValue("bookDone"))}`}</strong>
               </button>
             </div>
             <button class="delete-book-btn" aria-label="Удалить книгу" title="Удалить книгу" onclick="deleteBook(${index})">×</button>
@@ -1442,7 +1787,7 @@ function skillSection() {
         <div class="panel-title"><h2>Новое умение</h2><button class="primary-btn" onclick="addSkill()">Добавить умение</button></div>
         <div class="cards reading-list">${(state.skills || []).map((skill, index) => `
         <article class="journal-card skill-card book-card">
-          <div class="book-card-head"><span class="xp-pill">15 минут = ${gemLabel(XP_RULES.skill)}</span></div>
+          <div class="book-card-head"><span class="xp-pill">15 минут = ${gemLabel(rewardValue("skill"))}</span></div>
           <div class="book-facts">
             <div><span>Навык</span><input value="${escapeHtml(skill.name)}" oninput="updateSkill(${index}, 'name', this.value)" /></div>
             <div><span>Цель</span><input value="${escapeHtml(skill.goal)}" oninput="updateSkill(${index}, 'goal', this.value)" /></div>
@@ -1450,11 +1795,11 @@ function skillSection() {
           <div class="reading-actions">
             <button class="reading-toggle ${skill.practiceDone ? "active" : ""}" onclick="toggleSkillPractice(${index})">
               <span>${skill.practiceDone ? "✓ Занятие сделано" : "Занятие 15 минут"}</span>
-              <strong>${skill.practiceDone ? signedGem(XP_RULES.skill) : `даёт ${signedGem(XP_RULES.skill)}`}</strong>
+              <strong>${skill.practiceDone ? signedGem(rewardValue("skill")) : `даёт ${signedGem(rewardValue("skill"))}`}</strong>
             </button>
             <button class="reading-toggle ${skill.completed ? "active" : ""}" onclick="toggleSkillCompleted(${index})">
               <span>${skill.completed ? "✓ Умение освоено" : "Умение освоено"}</span>
-              <strong>${skill.completed ? signedGem(XP_RULES.skillDone) : `даёт ${signedGem(XP_RULES.skillDone)}`}</strong>
+              <strong>${skill.completed ? signedGem(rewardValue("skillDone")) : `даёт ${signedGem(rewardValue("skillDone"))}`}</strong>
             </button>
           </div>
           <button class="delete-book-btn" aria-label="Удалить умение" title="Удалить умение" onclick="deleteSkill(${index})">×</button>
@@ -1510,7 +1855,7 @@ function videosSection() {
               </button>
               <button class="reading-toggle ${video.insightRecorded ? "active" : ""}" ${video.insightRecorded ? "disabled" : ""} onclick="recordDiscoveryInsight(${index})">
                 <span>${video.insightRecorded ? "✓ Открытие записано" : "Записать открытие"}</span>
-                <strong>${video.insightRecorded ? signedGem(XP_RULES.video) : `даёт ${signedGem(XP_RULES.video)}`}</strong>
+                <strong>${video.insightRecorded ? signedGem(rewardValue("video")) : `даёт ${signedGem(rewardValue("video"))}`}</strong>
               </button>
             </div>
           </article>`).join("")}</div>
@@ -1526,18 +1871,18 @@ function hardThingSection() {
         <div class="panel-title"><h2>Сложное дело</h2><button class="primary-btn" onclick="addHardThing()">Добавить</button></div>
         <div class="cards reading-list">${state.hardThings.map((item, index) => `
           <article class="journal-card skill-card book-card">
-            <div class="book-card-head"><span class="xp-pill">15 минут = ${gemLabel(XP_RULES.hardThing)}</span></div>
+            <div class="book-card-head"><span class="xp-pill">15 минут = ${gemLabel(rewardValue("hardThing"))}</span></div>
             <div class="book-facts">
               <div><span>Дело</span><input value="${escapeHtml(item.title)}" oninput="updateHardThing(${index}, this.value)" /></div>
             </div>
             <div class="reading-actions">
               <button class="reading-toggle ${item.effortDone ? "active" : ""}" onclick="toggleHardThingEffort(${index})">
                 <span>${item.effortDone ? "✓ Усилие сделано" : "Усилие 15 минут"}</span>
-                <strong>${item.effortDone ? signedGem(XP_RULES.hardThing) : `даёт ${signedGem(XP_RULES.hardThing)}`}</strong>
+                <strong>${item.effortDone ? signedGem(rewardValue("hardThing")) : `даёт ${signedGem(rewardValue("hardThing"))}`}</strong>
               </button>
               <button class="reading-toggle ${item.completed ? "active" : ""}" onclick="toggleHardThingCompleted(${index})">
                 <span>${item.completed ? "✓ Дело доделано" : "Дело доделано"}</span>
-                <strong>${item.completed ? signedGem(XP_RULES.hardThingDone) : `даёт ${signedGem(XP_RULES.hardThingDone)}`}</strong>
+                <strong>${item.completed ? signedGem(rewardValue("hardThingDone")) : `даёт ${signedGem(rewardValue("hardThingDone"))}`}</strong>
               </button>
             </div>
             <button class="delete-book-btn" aria-label="Удалить дело" title="Удалить дело" onclick="removeHardThing(${index})">×</button>
@@ -1658,16 +2003,16 @@ function daySummarySection() {
   const todayRewards = (state.rewardHistory || []).filter((item) => !item.returned && item.redeemedAt?.slice(0, 10) === TODAY_ISO);
   const dayRows = [
     ...doneMissions.map((mission) => [`${mission.icon} ${mission.title}`, signedGem(mission.xp)]),
-    ...skillPractices.map((skill) => [`🧩 Новое умение: ${skill.name}`, signedGem(XP_RULES.skill)]),
-    ...hardEfforts.map((item) => [`🪓 Сложное дело: ${item.title}`, signedGem(XP_RULES.hardThing)]),
+    ...skillPractices.map((skill) => [`🧩 Новое умение: ${skill.name}`, signedGem(rewardValue("skill"))]),
+    ...hardEfforts.map((item) => [`🪓 Сложное дело: ${item.title}`, signedGem(rewardValue("hardThing"))]),
     ...homeTasks.map((role) => [`🏕️ Помощь по дому: ${role.title}`, signedGem(role.xp || 5)]),
-    ...discoveries.map((item) => [`${item.type === "подкаст" ? "🎙️" : "🔭"} Видео или подкаст: ${item.title}`, signedGem(XP_RULES.video)]),
+    ...discoveries.map((item) => [`${item.type === "подкаст" ? "🎙️" : "🔭"} Видео или подкаст: ${item.title}`, signedGem(rewardValue("video"))]),
     ...todayRewards.map((item) => [`🎒 Награда: ${item.title}`, signedGem(-item.cost)]),
   ];
   const bonusRows = [
-    ...completedBooks.map((book) => [`📄 Дочитал книгу: ${book.title}`, signedGem(XP_RULES.bookDone)]),
-    ...completedSkills.map((skill) => [`🧩 Умение освоено: ${skill.name}`, signedGem(XP_RULES.skillDone)]),
-    ...hardCompleted.map((item) => [`🪓 Сложное дело доделано: ${item.title}`, signedGem(XP_RULES.hardThingDone)]),
+    ...completedBooks.map((book) => [`📄 Дочитал книгу: ${book.title}`, signedGem(rewardValue("bookDone"))]),
+    ...completedSkills.map((skill) => [`🧩 Умение освоено: ${skill.name}`, signedGem(rewardValue("skillDone"))]),
+    ...hardCompleted.map((item) => [`🪓 Сложное дело доделано: ${item.title}`, signedGem(rewardValue("hardThingDone"))]),
   ];
   return `
     <main class="content">
@@ -1679,21 +2024,12 @@ function daySummarySection() {
           <div class="metric"><span>Осталось до костра</span><strong>${gemLabel(xpLeft())}</strong></div>
         </div>
         <div class="summary-list day-summary-list">
-          ${dayRows.length ? dayRows.map(([title, value]) => `<div class="summary-item"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("") : `
-            <div class="summary-item example"><strong>📘 Прочитать 30 минут</strong><span>${signedGem(10)}</span></div>
-            <div class="summary-item example"><strong>🎙️ Видео или подкаст: собирал миньона</strong><span>${signedGem(10)}</span></div>
-            <div class="summary-item example"><strong>🪓 Сложное дело: Собрать роботов-боксёров</strong><span>${signedGem(15)}</span></div>
-            <div class="summary-item example"><strong>🧩 Новое умение: Кубик Рубика</strong><span>${signedGem(15)}</span></div>
-            <div class="summary-item example"><strong>🏕️ Помощь по дому: Разбор стиральной машины</strong><span>${signedGem(5)}</span></div>
-          `}
+          ${dayRows.length ? dayRows.map(([title, value]) => `<div class="summary-item"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("") : `<div class="empty-state">Сегодня пока ничего не отмечено.</div>`}
         </div>
-      </section>
-      <section class="panel full">
-        <div class="panel-title"><h2>Бонусы дня</h2><span class="mini-chip">в общий баланс</span></div>
-        <div class="summary-list">${bonusRows.length ? bonusRows.map(([title, value]) => `<div class="summary-item bonus"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("") : `
-          <div class="summary-item bonus example"><strong>📄 Дочитал книгу: Дом роботов</strong><span>${signedGem(50)}</span></div>
-          <div class="summary-item bonus example"><strong>🧩 Умение освоено: Кубик Рубика</strong><span>${signedGem(50)}</span></div>
-        `}</div>
+        ${bonusRows.length ? `
+          <div class="panel-title inline-title"><h2>Бонусы дня</h2><span class="mini-chip">в общий баланс</span></div>
+          <div class="summary-list">${bonusRows.map(([title, value]) => `<div class="summary-item bonus"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("")}</div>
+        ` : ""}
       </section>
     </main>
   `;
@@ -1743,19 +2079,69 @@ function allTimeSummarySection() {
   `;
 }
 
+function parentLoginSection() {
+  return `
+    <main class="content">
+      <section class="panel full">
+        <div class="panel-title"><h2>Родительский вход</h2><span class="mini-chip">PIN</span></div>
+        <div class="fields">
+          <div class="field">
+            <label>Введите PIN родителя</label>
+            <input id="parent-pin-input" type="password" inputmode="numeric" autocomplete="off" placeholder="PIN" onkeydown="if(event.key === 'Enter') unlockParentMode()" />
+          </div>
+          <div class="row">
+            <button class="primary-btn" onclick="unlockParentMode()">Открыть родительский режим</button>
+            <button class="ghost-btn" onclick="setSection('Главный экран')">Назад</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  `;
+}
+
 function parentSection() {
   const status = survivalStatus();
   const readingGoals = { ...initialState.readingGoals, ...(state.readingGoals || {}) };
   const discoveryGoals = { ...initialState.discoveryGoals, ...(state.discoveryGoals || {}) };
+  const rewardRules = { ...DEFAULT_REWARD_RULES, ...(state.rewardRules || {}) };
+  const manualDate = state.parentManualDate || TODAY_ISO;
+  const manualDateSurvived = state.calendarStatuses?.[manualDate] === "survived";
+  const syncStatus = supabaseSync.enabled
+    ? (supabaseSync.lastSavedAt ? `Supabase: сохранено ${supabaseSync.lastSavedAt}` : "Supabase: подключён")
+    : "Supabase: не настроен";
   return `
     <main class="content">
       <div class="content-grid">
         <section class="panel wide">
-          <div class="panel-title"><h2>Настройки родителя</h2><span class="mini-chip">Мягкая рамка</span></div>
+          <div class="panel-title"><h2>Настройки родителя</h2><span class="mini-chip">${syncStatus}</span></div>
           <div class="fields">
+            <div class="field">
+              <label>PIN родителя</label>
+              <input type="password" value="${escapeHtml(state.parentPin)}" minlength="4" onchange="updateParentPin(this.value)" />
+            </div>
             <div class="field">
               <label>Дневная цель в алмазах</label>
               <input type="number" value="${state.dailyGoal}" min="10" max="120" onchange="state.dailyGoal = Number(this.value); render();" />
+            </div>
+            <div class="field">
+              <label>Кристаллы за миссии дня</label>
+              <div class="reward-settings-grid">
+                <div class="field"><label>Прочитать 30 минут</label><input type="number" min="0" value="${rewardRules.reading}" onchange="updateRewardRule('reading', this.value)" /></div>
+                <div class="field"><label>Сложное дело</label><input type="number" min="0" value="${rewardRules.hardThing}" onchange="updateRewardRule('hardThing', this.value)" /></div>
+                <div class="field"><label>Шаг по навыку</label><input type="number" min="0" value="${rewardRules.skill}" onchange="updateRewardRule('skill', this.value)" /></div>
+                <div class="field"><label>Видео или подкаст</label><input type="number" min="0" value="${rewardRules.video}" onchange="updateRewardRule('video', this.value)" /></div>
+                <div class="field"><label>Дневник наблюдений</label><input type="number" min="0" value="${rewardRules.observationDiary}" onchange="updateRewardRule('observationDiary', this.value)" /></div>
+                <div class="field"><label>Помощь по дому</label><input type="number" min="0" value="${rewardRules.responsibility}" onchange="updateRewardRule('responsibility', this.value)" /></div>
+              </div>
+            </div>
+            <div class="field">
+              <label>Кристаллы за большие завершения</label>
+              <div class="reward-settings-grid">
+                <div class="field"><label>Дневник чтения</label><input type="number" min="0" value="${rewardRules.readingDiary}" onchange="updateRewardRule('readingDiary', this.value)" /></div>
+                <div class="field"><label>Книга прочитана</label><input type="number" min="0" value="${rewardRules.bookDone}" onchange="updateRewardRule('bookDone', this.value)" /></div>
+                <div class="field"><label>Умение освоено</label><input type="number" min="0" value="${rewardRules.skillDone}" onchange="updateRewardRule('skillDone', this.value)" /></div>
+                <div class="field"><label>Сложное дело доделано</label><input type="number" min="0" value="${rewardRules.hardThingDone}" onchange="updateRewardRule('hardThingDone', this.value)" /></div>
+              </div>
             </div>
             <div class="field-pair">
               <div class="field">
@@ -1771,36 +2157,46 @@ function parentSection() {
               <label>Цель открытий: видео и подкастов за лето</label>
               <input type="number" value="${discoveryGoals.items}" min="0" max="100" onchange="updateDiscoveryGoal(this.value)" />
             </div>
-            <div class="field source-manager">
-              <label>Источники для открытий</label>
-              <div class="source-add-row">
-                <input value="${escapeHtml(state.discoverySourceDraft || "")}" placeholder="Добавить источник" oninput="updateDiscoverySourceDraft(this.value)" />
-                <button class="secondary-btn" onclick="addDiscoverySource()">Добавить</button>
-              </div>
-              <div class="source-list">${(state.discoverySources || initialState.discoverySources).map((source, index) => `
-                <div class="source-item">
-                  <input value="${escapeHtml(source)}" onchange="updateDiscoverySource(${index}, this.value)" />
-                  <button class="icon-btn" title="Удалить источник" onclick="removeDiscoverySource(${index})">×</button>
-                </div>
-              `).join("")}</div>
-            </div>
             <div class="field">
-              <label>Комментарий родителя</label>
-              <textarea onchange="updateParentComment(this.value)">${state.parentComment}</textarea>
+              <label>Миссии сегодняшней ночи</label>
+              <div class="home-task-list">
+                ${state.missions.map((mission, index) => `
+                  <div class="home-task-row ${mission.done ? "done" : ""}">
+                    <span class="camp-mission-icon">${mission.icon || "💎"}</span>
+                    <input value="${escapeHtml(mission.title)}" oninput="updateMissionFromParent(${index}, 'title', this.value)" />
+                    <input class="xp-input" type="number" min="0" value="${mission.xp || 0}" oninput="updateMissionFromParent(${index}, 'xp', this.value)" />
+                    <span class="mini-chip">${mission.custom ? "добавлена" : "базовая"}</span>
+                    ${mission.custom ? `<button class="icon-btn" title="Удалить миссию" onclick="removeDailyMission(${index})">×</button>` : `<span></span>`}
+                  </div>
+                `).join("")}
+              </div>
+              <button class="secondary-btn" onclick="addDailyMission()">Добавить миссию в сегодняшнюю ночь</button>
             </div>
             <label class="row"><input type="checkbox" ${state.softMode ? "checked" : ""} onchange="state.softMode = this.checked; render();" style="width:auto" /> Мягкий режим: 30+ ${GEM} можно зачесть вручную</label>
+            <div class="field manual-survive-box">
+              <label>Ручной зачёт ночи</label>
+              <div class="field-pair">
+                <div class="field">
+                  <label>Дата</label>
+                  <input type="date" min="2026-05-25" max="2026-08-31" value="${manualDate}" onchange="setParentManualDate(this.value)" />
+                </div>
+                <div class="field">
+                  <label>Статус</label>
+                  <div class="mini-chip">${nightLabelByIso(manualDate)} · ${manualDateSurvived ? "Ночь пройдена" : "Не зачтена"}</div>
+                </div>
+              </div>
+              <button class="${manualDateSurvived ? "secondary-btn" : "primary-btn"}" onclick="toggleManualSurvive()">${manualDateSurvived ? "Отменить зачёт" : "Отметить ночь как выжившую"}</button>
+            </div>
           </div>
           <div class="row">
-            <button class="primary-btn" onclick="manualSurvive()">Вручную отметить день как выживший</button>
-            <button class="secondary-btn" onclick="resetStreakSoftly()">Мягко сбросить серию</button>
-            <button class="ghost-btn" onclick="returnToTrail()">Вернулся на тропу</button>
+            <button class="ghost-btn" onclick="forceSupabaseSave()">Сохранить в Supabase</button>
+            <button class="ghost-btn" onclick="lockParentMode()">Закрыть родительский режим</button>
           </div>
         </section>
         <aside class="panel side">
           <h3>Статус дня</h3>
           <p><strong>${status.label}</strong></p>
-          <p class="muted">${state.parentComment}</p>
-          <p>Серия начнётся заново. В лесу так бывает: главное — снова выйти на тропу.</p>
+          <p class="muted">Здесь можно менять правила, цели и вручную зачесть ночь в мягком режиме.</p>
         </aside>
       </div>
     </main>
@@ -1820,6 +2216,7 @@ function sectionHtml() {
     "Итог дня": daySummarySection,
     "Итог за всё время": allTimeSummarySection,
     "Итоги недели": weeklySection,
+    "Вход родителя": parentLoginSection,
     "Родитель": parentSection,
   };
   return (map[state.activeSection] || dashboard)();
@@ -1831,3 +2228,4 @@ function render() {
 }
 
 render();
+initSupabaseSync();

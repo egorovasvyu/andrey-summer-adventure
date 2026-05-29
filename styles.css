@@ -352,6 +352,12 @@ h1 {
   border: 1px solid rgba(255, 220, 162, 0.12);
 }
 
+.home-task-row .mini-chip {
+  justify-self: start;
+  padding: 7px 10px;
+  box-shadow: none;
+}
+
 .home-task-row.done {
   background: rgba(43, 108, 67, 0.38);
   border-color: rgba(127, 218, 134, 0.34);
@@ -1299,6 +1305,12 @@ h1 {
   gap: 10px;
 }
 
+.reward-settings-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .field label {
   color: var(--muted);
   font-size: 0.9rem;
@@ -1576,7 +1588,8 @@ textarea {
     grid-template-columns: 1fr;
   }
 
-  .field-pair {
+  .field-pair,
+  .reward-settings-grid {
     grid-template-columns: 1fr;
   }
 
