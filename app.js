@@ -261,6 +261,7 @@ function prepareState(nextState) {
       };
     }
   }
+  nextState.survivedNights = survivedNightCount(nextState);
 
   initialState.missions.forEach((mission) => {
     const savedMission = nextState.missions.find((item) => item.id === mission.id);
@@ -727,7 +728,7 @@ function saveCalendarStatus() {
   if (!date) return;
   state.calendarStatuses[date] = status;
   state.selectedCalendarDate = date;
-  state.survivedNights = Object.values(state.calendarStatuses).filter((item) => item === "survived").length;
+  recalculateSurvivedNights();
   showToast(status === "survived" ? "Ночь отмечена как пройденная." : "Статус дня обновлён мягко.");
   render();
 }
@@ -860,7 +861,8 @@ function completeMission(id) {
     state.todayXp = Math.max(0, state.todayXp - mission.xp);
     state.totalXp = Math.max(0, state.totalXp - mission.xp);
     if (!state.manualSurvived && state.todayXp < state.dailyGoal && state.survivedNights >= state.night) {
-      state.survivedNights = Math.max(0, state.night - 1);
+      if (state.calendarStatuses?.[TODAY_ISO] === "survived") state.calendarStatuses[TODAY_ISO] = "current";
+      recalculateSurvivedNights();
       state.currentStreak = Math.max(0, state.currentStreak - 1);
     }
     showToast(`Отменено: ${signedGem(-mission.xp)}.`);
@@ -1118,7 +1120,9 @@ function awardXp(xp, message) {
   state.todayXp += xp;
   state.totalXp += xp;
   if (!wasSurvived && state.todayXp >= state.dailyGoal) {
-    state.survivedNights = Math.max(state.survivedNights, state.night);
+    if (!state.calendarStatuses) state.calendarStatuses = {};
+    if (TODAY_ISO >= "2026-05-25" && TODAY_ISO <= "2026-08-31") state.calendarStatuses[TODAY_ISO] = "survived";
+    recalculateSurvivedNights();
     state.currentStreak += 1;
     state.bestStreak = Math.max(state.bestStreak, state.currentStreak);
   }
@@ -1447,7 +1451,11 @@ function setParentManualDate(value) {
 }
 
 function recalculateSurvivedNights() {
-  state.survivedNights = Object.values(state.calendarStatuses || {}).filter((item) => item === "survived").length;
+  state.survivedNights = survivedNightCount(state);
+}
+
+function survivedNightCount(source = state) {
+  return Object.values(source.calendarStatuses || {}).filter((item) => item === "survived").length;
 }
 
 function toggleManualSurvive() {
@@ -1499,12 +1507,13 @@ function returnToTrail() {
 
 function hero() {
   const status = survivalStatus();
+  const survivedCount = survivedNightCount();
   return `
     <section class="hero">
       <div class="topbar">
         <div class="top-stats">
           <span class="stat-chip">Накоплено <strong>${gemLabel(state.totalXp)}</strong></span>
-          <span class="stat-chip">Ночей пройдено <strong>${state.survivedNights} / 99</strong></span>
+          <span class="stat-chip">Ночей пройдено <strong>${survivedCount} / 99</strong></span>
           <button class="stat-chip stat-button reward-stat" onclick="setSection('Награды')">Награды</button>
         </div>
         <button class="parent-link" onclick="setSection('Родитель')">Родитель</button>
@@ -1680,12 +1689,13 @@ function mapSection() {
   const selectedIso = state.selectedCalendarDate;
   const selectedEvents = state.calendarEvents[selectedIso] || [];
   const weekDays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+  const survivedCount = survivedNightCount();
   return `
     <main class="content">
       <section class="panel full summer-map">
         <div class="panel-title">
           <h2>Карта лета</h2>
-          <span class="mini-chip">25 мая — 31 августа · ровно 99 ночей · 🏕️ ${state.survivedNights} ночей пройдено</span>
+          <span class="mini-chip">25 мая — 31 августа · ровно 99 ночей · 🏕️ ${survivedCount} ночей пройдено</span>
         </div>
 
         <div class="calendar-layout calendar-only">
@@ -2118,6 +2128,7 @@ function daySummarySection() {
 }
 
 function allTimeSummarySection() {
+  const survivedCount = survivedNightCount();
   const completedBooks = (state.books || []).filter((book) => book.completed || book.status === "прочитано");
   const completedPages = completedBooks.reduce((sum, book) => sum + (Number(book.pages) || 0), 0);
   const diaryCount = (state.books || []).filter((book) => book.diaryDone).length;
@@ -2133,7 +2144,7 @@ function allTimeSummarySection() {
       <section class="panel full">
         <div class="panel-title"><h2>Итог за всё время</h2><span class="mini-chip">${gemLabel(state.totalXp)} сейчас</span></div>
         <div class="day-summary-top">
-          <div class="metric"><span>Ночей пройдено</span><strong>${state.survivedNights} / 99</strong></div>
+          <div class="metric"><span>Ночей пройдено</span><strong>${survivedCount} / 99</strong></div>
           <div class="metric"><span>Алмазов накоплено</span><strong>${gemLabel(state.totalXp)}</strong></div>
           <div class="metric"><span>Потрачено на награды</span><strong>${gemLabel(rewardSpent)}</strong></div>
         </div>
