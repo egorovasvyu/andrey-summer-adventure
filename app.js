@@ -57,6 +57,7 @@ const SUPABASE_TABLE = "app_state_documents";
 const SUPABASE_SAVE_DELAY = 700;
 const DAILY_RESET_VERSION = 3;
 const DISCOVERY_RESET_VERSION = 2;
+const HISTORY_SEED_VERSION = 1;
 
 const supabaseSync = {
   client: null,
@@ -113,6 +114,8 @@ const initialState = {
     text: "",
   },
   parentManualDate: TODAY_ISO,
+  activityLog: [],
+  historySeedVersion: 0,
   calendarEvents: {},
   calendarStatuses: {
     "2026-05-25": "survived",
@@ -211,6 +214,8 @@ function loadState() {
       rewardRules: { ...initialState.rewardRules, ...(parsed.rewardRules || {}) },
       rewardLabels: { ...initialState.rewardLabels, ...(parsed.rewardLabels || {}) },
       discoverySources: parsed.discoverySources || initialState.discoverySources,
+      activityLog: parsed.activityLog || initialState.activityLog,
+      historySeedVersion: parsed.historySeedVersion || 0,
     });
   } catch (error) {
     return prepareState(structuredClone(initialState));
@@ -243,6 +248,10 @@ function prepareState(nextState) {
     nextState.activeSection = "Главный экран";
   }
   if (!nextState.parentManualDate) nextState.parentManualDate = TODAY_ISO;
+  nextState.activityLog = normalizeActivityLog(nextState.activityLog || []);
+  if (nextState.historySeedVersion !== HISTORY_SEED_VERSION) {
+    applyInitialActivityHistory(nextState);
+  }
   if (TODAY_ISO >= "2026-05-25" && TODAY_ISO <= "2026-08-31") {
     Object.keys(nextState.calendarStatuses || {}).forEach((date) => {
       if (nextState.calendarStatuses[date] === "current" && date !== TODAY_ISO) {
@@ -281,7 +290,8 @@ function prepareState(nextState) {
     const oldInsight = item.insight || "";
     const title = item.title === "Открытие 2" && type === "подкаст" ? "Собирал миньона" : (item.title || "Новое открытие");
     const source = item.source === "Источник добавит родитель" ? "" : (item.source || "");
-    return {
+    return ensureEntityId({
+      id: item.id,
       title,
       source,
       type,
@@ -289,7 +299,7 @@ function prepareState(nextState) {
       insight: meaningfulInsight(oldInsight),
       viewedAwarded: Boolean(item.viewedAwarded),
       insightRecorded: Boolean(item.insightRecorded),
-    };
+    }, "discovery");
   });
 
   const migratedSkill = {
@@ -302,14 +312,16 @@ function prepareState(nextState) {
   }
   const savedSkills = Array.isArray(nextState.skills) && nextState.skills.length ? nextState.skills : [migratedSkill];
   nextState.skills = savedSkills.map((skill) => ({
+    id: skill.id,
     name: skill.name || "Новое умение",
     goal: skill.goal || "Цель на лето",
     practiceDone: Boolean(skill.practiceDone),
     completed: Boolean(skill.completed),
-  }));
+  })).map((skill) => ensureEntityId(skill, "skill"));
   nextState.skill = nextState.skills[0] || structuredClone(initialState.skill);
   nextState.hardThings = (nextState.hardThings || initialState.hardThings).map((item) => (
     typeof item === "string" ? { title: item, done: false } : {
+      id: item.id,
       title: item.title || "Сложное дело",
       kind: item.kind || "regular",
       effortDone: Boolean(item.effortDone || item.done),
@@ -317,16 +329,32 @@ function prepareState(nextState) {
       bonusXp: Math.max(0, Number(item.bonusXp ?? rewardValueFrom(nextState, "hardThingDone")) || 0),
       completedXpAwarded: Math.max(0, Number(item.completedXpAwarded) || 0),
     }
-  ));
+  )).map((item) => ensureEntityId(item, "hard"));
 
   const defaultHomeTasks = structuredClone(initialState.roles);
   const savedRoles = nextState.roles || [];
   const looksLikeOldRoles = savedRoles.some((role) => role.frequency || role.comment || role.status);
   nextState.roles = looksLikeOldRoles ? defaultHomeTasks : savedRoles.map((role) => ({
+    id: role.id,
     title: role.title || "Домашнее дело",
     xp: Number(role.xp) || 5,
     done: Boolean(role.done || Number(role.todayCount)),
-  }));
+  })).map((role) => ensureEntityId(role, "home"));
+
+  nextState.books = (nextState.books || []).map((book) => ensureEntityId({
+    ...book,
+    pages: Number(book.pages) || 0,
+    diaryDone: Boolean(book.diaryDone),
+    completed: Boolean(book.completed || book.status === "прочитано"),
+  }, "book"));
+
+  nextState.rewards = (nextState.rewards || []).map((reward) => ensureEntityId(reward, "reward"));
+  nextState.rewardHistory = (nextState.rewardHistory || []).map((item) => ensureEntityId(item, "reward-history"));
+  seedActivityLogFromCurrentState(nextState);
+  nextState.totalXp = activityTotal(nextState.activityLog);
+  nextState.todayXp = todayActivityTotal(nextState.activityLog);
+  syncCalendarStatusesFromLog(nextState);
+  nextState.survivedNights = survivedNightCount(nextState);
 
   const oldDemoEvents = {
     "2026-06-10": "Лагерь",
@@ -488,8 +516,11 @@ async function loadSupabaseState() {
       .eq("family_key", supabaseSync.familyKey)
       .maybeSingle();
     if (error) throw error;
+    let shouldSavePreparedState = false;
     if (data?.state) {
-      const shouldSavePreparedState = data.state.discoveryResetVersion !== DISCOVERY_RESET_VERSION;
+      shouldSavePreparedState =
+        data.state.discoveryResetVersion !== DISCOVERY_RESET_VERSION ||
+        data.state.historySeedVersion !== HISTORY_SEED_VERSION;
       state = prepareState({
         ...structuredClone(initialState),
         ...data.state,
@@ -502,17 +533,21 @@ async function loadSupabaseState() {
         rewardRules: { ...initialState.rewardRules, ...(data.state.rewardRules || {}) },
         rewardLabels: { ...initialState.rewardLabels, ...(data.state.rewardLabels || {}) },
         discoverySources: data.state.discoverySources || initialState.discoverySources,
+        activityLog: data.state.activityLog || initialState.activityLog,
+        historySeedVersion: data.state.historySeedVersion || 0,
       });
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
       } catch (error) {
         console.warn("Локальное сохранение недоступно", error);
       }
-      if (shouldSavePreparedState) queueSupabaseSave();
       showToast("Данные загружены из Supabase.");
     }
     supabaseSync.ready = true;
     render();
+    if (shouldSavePreparedState) {
+      setTimeout(saveSupabaseState, SUPABASE_SAVE_DELAY);
+    }
   } catch (error) {
     supabaseSync.ready = false;
     supabaseSync.lastError = describeSupabaseError(error);
@@ -618,6 +653,325 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function makeId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeActivityLog(log) {
+  return (Array.isArray(log) ? log : []).map((item) => ({
+    id: item.id || makeId("activity"),
+    sourceKey: item.sourceKey || item.id || makeId("source"),
+    date: item.date || TODAY_ISO,
+    icon: item.icon || "💎",
+    title: item.title || "Активность",
+    xp: Number(item.xp) || 0,
+    daily: item.daily !== false,
+    bonus: Boolean(item.bonus),
+  }));
+}
+
+function initialActivityHistory() {
+  const campDays = ["2026-05-25", "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29"].map((date) => ({
+    sourceKey: `history:camp:${date}`,
+    date,
+    icon: "🏕️",
+    title: "Лагерь",
+    xp: 40,
+    daily: true,
+    bonus: false,
+  }));
+  return [
+    ...campDays,
+    {
+      sourceKey: "history:no-shop:2026-05-30",
+      date: "2026-05-30",
+      icon: "🧭",
+      title: "День без магазина",
+      xp: 10,
+      daily: true,
+      bonus: false,
+    },
+    {
+      sourceKey: "history:task-20:2026-05-31",
+      date: "2026-05-31",
+      icon: "✏️",
+      title: "Задание 20 минут",
+      xp: 20,
+      daily: true,
+      bonus: false,
+    },
+    {
+      sourceKey: "history:trash:2026-05-31",
+      date: "2026-05-31",
+      icon: "🏕️",
+      title: "Помощь по дому: вынос мусора",
+      xp: 5,
+      daily: true,
+      bonus: false,
+    },
+    {
+      sourceKey: "history:reading:2026-05-31",
+      date: "2026-05-31",
+      icon: "📘",
+      title: "Прочитал 30 минут",
+      xp: 15,
+      daily: true,
+      bonus: false,
+    },
+  ];
+}
+
+function applyInitialActivityHistory(nextState) {
+  nextState.activityLog = initialActivityHistory().map((item) => ({
+    id: makeId("activity"),
+    ...item,
+  }));
+  if (!nextState.calendarStatuses) nextState.calendarStatuses = {};
+  ["2026-05-25", "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-31"].forEach((date) => {
+    nextState.calendarStatuses[date] = "survived";
+  });
+  nextState.totalXp = activityTotal(nextState.activityLog);
+  nextState.todayXp = todayActivityTotal(nextState.activityLog);
+  nextState.survivedNights = survivedNightCount(nextState);
+  nextState.historySeedVersion = HISTORY_SEED_VERSION;
+}
+
+function activityTotal(log = state.activityLog || []) {
+  return log.reduce((sum, item) => sum + (Number(item.xp) || 0), 0);
+}
+
+function todayActivityTotal(log = state.activityLog || []) {
+  return log
+    .filter((item) => item.date === TODAY_ISO && item.daily)
+    .reduce((sum, item) => sum + (Number(item.xp) || 0), 0);
+}
+
+function syncCalendarStatusesFromLog(nextState) {
+  if (!nextState.calendarStatuses) nextState.calendarStatuses = {};
+  const dayTotals = (nextState.activityLog || []).reduce((map, item) => {
+    if (!item.daily) return map;
+    map[item.date] = (map[item.date] || 0) + (Number(item.xp) || 0);
+    return map;
+  }, {});
+  Object.entries(dayTotals).forEach(([date, total]) => {
+    if (date < "2026-05-25" || date > "2026-08-31") return;
+    nextState.calendarStatuses[date] = total >= nextState.dailyGoal ? "survived" : (date === TODAY_ISO ? "current" : "planned");
+  });
+}
+
+function hasActivity(nextState, sourceKey) {
+  return (nextState.activityLog || []).some((item) => item.sourceKey === sourceKey);
+}
+
+function seedActivity(nextState, sourceKey, entry) {
+  if (hasActivity(nextState, sourceKey)) return;
+  nextState.activityLog.push({
+    id: makeId("activity"),
+    sourceKey,
+    date: entry.date || TODAY_ISO,
+    icon: entry.icon || "💎",
+    title: entry.title || "Активность",
+    xp: Number(entry.xp) || 0,
+    daily: entry.daily !== false,
+    bonus: Boolean(entry.bonus),
+  });
+}
+
+function seedActivityLogFromCurrentState(nextState) {
+  nextState.activityLog = normalizeActivityLog(nextState.activityLog || []);
+
+  (nextState.missions || []).forEach((mission) => {
+    if (mission.done && !["skill", "hard", "role", "video"].includes(mission.id)) {
+      seedActivity(nextState, `mission:${mission.id}`, {
+        icon: mission.icon,
+        title: mission.title,
+        xp: Number(mission.xp) || 0,
+      });
+    }
+  });
+
+  (nextState.books || []).forEach((book) => {
+    if (book.diaryDone) {
+      seedActivity(nextState, `bookDiary:${book.id}`, {
+        icon: "📄",
+        title: `Внесено в дневник: ${book.title}`,
+        xp: rewardValueFrom(nextState, "readingDiary"),
+      });
+    }
+    if (book.completed || book.status === "прочитано") {
+      seedActivity(nextState, `bookDone:${book.id}`, {
+        icon: "📘",
+        title: `Дочитал книгу: ${book.title}`,
+        xp: rewardValueFrom(nextState, "bookDone"),
+        daily: false,
+        bonus: true,
+      });
+    }
+  });
+
+  (nextState.skills || []).forEach((skill) => {
+    if (skill.practiceDone) {
+      seedActivity(nextState, `skillPractice:${skill.id}`, {
+        icon: "🧩",
+        title: `Новое умение: ${skill.name}`,
+        xp: rewardForMission("skill", nextState),
+      });
+    }
+    if (skill.completed) {
+      seedActivity(nextState, `skillDone:${skill.id}`, {
+        icon: "🧩",
+        title: `Умение освоено: ${skill.name}`,
+        xp: rewardValueFrom(nextState, "skillDone"),
+        daily: false,
+        bonus: true,
+      });
+    }
+  });
+
+  (nextState.hardThings || []).forEach((item) => {
+    if (item.effortDone) {
+      seedActivity(nextState, `hardEffort:${item.id}`, {
+        icon: "🪓",
+        title: `Сложное дело: ${item.title}`,
+        xp: rewardForMission("hard", nextState),
+      });
+    }
+    if (item.completed) {
+      seedActivity(nextState, `hardDone:${item.id}`, {
+        icon: "🪓",
+        title: `${item.kind === "big" ? "Особо сложное дело" : "Сложное дело доделано"}: ${item.title}`,
+        xp: item.kind === "big" ? Math.max(0, Number(item.bonusXp) || 0) : rewardValueFrom(nextState, "hardThingDone"),
+        daily: false,
+        bonus: true,
+      });
+    }
+  });
+
+  (nextState.roles || []).forEach((role) => {
+    if (role.done) {
+      seedActivity(nextState, `home:${role.id}`, {
+        icon: "🏕️",
+        title: `Помощь по дому: ${role.title}`,
+        xp: Number(role.xp) || 5,
+      });
+    }
+  });
+
+  (nextState.videos || []).forEach((item) => {
+    if (item.viewedAwarded) {
+      seedActivity(nextState, `discoveryViewed:${item.id}`, {
+        icon: "🔭",
+        title: `${item.type === "подкаст" ? "Подкаст" : "Видео"}: ${item.title}`,
+        xp: rewardForMission("video", nextState),
+      });
+    }
+    if (item.insightRecorded) {
+      seedActivity(nextState, `discoveryInsight:${item.id}`, {
+        icon: "🔭",
+        title: `Новая находка: ${item.title}`,
+        xp: rewardForMission("video", nextState),
+      });
+    }
+  });
+}
+
+function ensureEntityId(item, prefix) {
+  if (!item.id) item.id = makeId(prefix);
+  return item;
+}
+
+function activityTitle(entry) {
+  return `${entry.icon || "💎"} ${entry.title || "Активность"}`;
+}
+
+function logActivity(sourceKey, { icon = "💎", title, xp = 0, daily = true, bonus = false, date = TODAY_ISO } = {}) {
+  if (!state.activityLog) state.activityLog = [];
+  const existing = state.activityLog.find((item) => item.sourceKey === sourceKey);
+  if (existing) {
+    existing.icon = icon;
+    existing.title = title;
+    existing.xp = Number(xp) || 0;
+    existing.daily = daily;
+    existing.bonus = bonus;
+    if (!existing.date) existing.date = date;
+    return existing;
+  }
+  const entry = {
+    id: makeId("activity"),
+    sourceKey,
+    date,
+    icon,
+    title,
+    xp: Number(xp) || 0,
+    daily,
+    bonus,
+  };
+  state.activityLog.push(entry);
+  return entry;
+}
+
+function removeActivity(sourceKey) {
+  state.activityLog = (state.activityLog || []).filter((item) => item.sourceKey !== sourceKey);
+}
+
+function syncActivityTitle(sourceKey, title) {
+  const entry = (state.activityLog || []).find((item) => item.sourceKey === sourceKey);
+  if (entry) entry.title = title;
+}
+
+function updateActivityDate(id, value) {
+  const entry = (state.activityLog || []).find((item) => item.id === id);
+  if (!entry) return;
+  const oldDate = entry.date;
+  entry.date = value || TODAY_ISO;
+  recalculateFromActivityLog([oldDate, entry.date]);
+  render();
+}
+
+function deleteActivityEntry(id) {
+  const entry = (state.activityLog || []).find((item) => item.id === id);
+  if (!entry) return;
+  const oldDate = entry.date;
+  state.activityLog = (state.activityLog || []).filter((item) => item.id !== id);
+  recalculateFromActivityLog([oldDate]);
+  showToast("Запись удалена из истории.");
+  render();
+}
+
+function recalculateFromActivityLog(affectedDates = []) {
+  state.totalXp = activityTotal(state.activityLog || []);
+  state.todayXp = todayActivityTotal(state.activityLog || []);
+  updateCalendarStatusesFromActivityLog(affectedDates);
+  if (!state.manualSurvived && state.todayXp < state.dailyGoal && state.calendarStatuses?.[TODAY_ISO] === "survived") {
+    state.calendarStatuses[TODAY_ISO] = "current";
+    recalculateSurvivedNights();
+  }
+  if (state.todayXp >= state.dailyGoal && TODAY_ISO >= "2026-05-25" && TODAY_ISO <= "2026-08-31") {
+    if (!state.calendarStatuses) state.calendarStatuses = {};
+    state.calendarStatuses[TODAY_ISO] = "survived";
+    recalculateSurvivedNights();
+  }
+}
+
+function updateCalendarStatusesFromActivityLog(affectedDates = []) {
+  if (!state.calendarStatuses) state.calendarStatuses = {};
+  const dayTotals = (state.activityLog || []).reduce((map, item) => {
+    if (!item.daily) return map;
+    map[item.date] = (map[item.date] || 0) + (Number(item.xp) || 0);
+    return map;
+  }, {});
+  affectedDates.filter(Boolean).forEach((date) => {
+    if (date < "2026-05-25" || date > "2026-08-31") return;
+    const total = dayTotals[date] || 0;
+    state.calendarStatuses[date] = total >= state.dailyGoal ? "survived" : (date === TODAY_ISO ? "current" : "planned");
+  });
+  Object.entries(dayTotals).forEach(([date, total]) => {
+    if (date < "2026-05-25" || date > "2026-08-31") return;
+    state.calendarStatuses[date] = total >= state.dailyGoal ? "survived" : (date === TODAY_ISO ? "current" : "planned");
+  });
+  recalculateSurvivedNights();
 }
 
 function isoDate(date) {
@@ -858,6 +1212,7 @@ function completeMission(id) {
   if (!mission) return;
   if (mission.done) {
     mission.done = false;
+    removeActivity(`mission:${mission.id}`);
     state.todayXp = Math.max(0, state.todayXp - mission.xp);
     state.totalXp = Math.max(0, state.totalXp - mission.xp);
     if (!state.manualSurvived && state.todayXp < state.dailyGoal && state.survivedNights >= state.night) {
@@ -870,6 +1225,11 @@ function completeMission(id) {
     return;
   }
   mission.done = true;
+  logActivity(`mission:${mission.id}`, {
+    icon: mission.icon,
+    title: mission.title,
+    xp: mission.xp,
+  });
   awardXp(mission.xp, `${signedGem(mission.xp)}. Костёр стал ярче.`);
 }
 
@@ -879,9 +1239,15 @@ function completeHomeTask(index) {
   const xp = Number(task.xp) || 5;
   task.done = !task.done;
   if (task.done) {
+    logActivity(`home:${task.id}`, {
+      icon: "🏕️",
+      title: `Помощь по дому: ${task.title}`,
+      xp,
+    });
     awardXp(xp, `${signedGem(xp)} за помощь по дому.`);
     return;
   }
+  removeActivity(`home:${task.id}`);
   state.todayXp = Math.max(0, state.todayXp - xp);
   state.totalXp = Math.max(0, state.totalXp - xp);
   showToast(`Отменено: ${signedGem(-xp)}.`);
@@ -889,7 +1255,7 @@ function completeHomeTask(index) {
 }
 
 function addHomeTask() {
-  state.roles.push({ title: "Новое домашнее дело", xp: 5, done: false });
+  state.roles.push({ id: makeId("home"), title: "Новое домашнее дело", xp: 5, done: false });
   showToast("Дело добавлено в помощь по дому.");
   render();
 }
@@ -898,6 +1264,11 @@ function updateHomeTask(index, field, value) {
   const task = state.roles[index];
   if (!task) return;
   task[field] = field === "xp" ? Math.max(0, Number(value) || 0) : value;
+  if (field === "title") syncActivityTitle(`home:${task.id}`, `Помощь по дому: ${task.title}`);
+  if (field === "xp") {
+    const entry = state.activityLog?.find((item) => item.sourceKey === `home:${task.id}`);
+    if (entry) entry.xp = Number(task.xp) || 5;
+  }
   render();
 }
 
@@ -905,6 +1276,11 @@ function saveHomeTaskField(index, field, value) {
   const task = state.roles[index];
   if (!task) return;
   task[field] = field === "xp" ? Math.max(0, Number(value) || 0) : value;
+  if (field === "title") syncActivityTitle(`home:${task.id}`, `Помощь по дому: ${task.title}`);
+  if (field === "xp") {
+    const entry = state.activityLog?.find((item) => item.sourceKey === `home:${task.id}`);
+    if (entry) entry.xp = Number(task.xp) || 5;
+  }
   saveState();
 }
 
@@ -912,6 +1288,7 @@ function removeHomeTask(index) {
   const task = state.roles[index];
   if (!task) return;
   const xpToRemove = task.done ? (Number(task.xp) || 5) : 0;
+  removeActivity(`home:${task.id}`);
   state.todayXp = Math.max(0, state.todayXp - xpToRemove);
   state.totalXp = Math.max(0, state.totalXp - xpToRemove);
   state.roles.splice(index, 1);
@@ -930,6 +1307,8 @@ function updateSkill(index, field, value) {
   const skill = state.skills[index];
   if (!skill) return;
   skill[field] = value;
+  syncActivityTitle(`skillPractice:${skill.id}`, `Новое умение: ${skill.name}`);
+  syncActivityTitle(`skillDone:${skill.id}`, `Умение освоено: ${skill.name}`);
   state.skill = state.skills[0] || structuredClone(initialState.skill);
   saveState();
 }
@@ -941,9 +1320,15 @@ function toggleSkillPractice(index) {
   const mission = state.missions.find((item) => item.id === "skill");
   if (mission) mission.done = state.skills.some((item) => item.practiceDone);
   if (skill.practiceDone) {
+    logActivity(`skillPractice:${skill.id}`, {
+      icon: "🧩",
+      title: `Новое умение: ${skill.name}`,
+      xp: missionXp("skill"),
+    });
     awardXp(missionXp("skill"), `${signedGem(missionXp("skill"))} за занятие 15 минут.`);
     return;
   }
+  removeActivity(`skillPractice:${skill.id}`);
   state.todayXp = Math.max(0, state.todayXp - missionXp("skill"));
   state.totalXp = Math.max(0, state.totalXp - missionXp("skill"));
   showToast(`Занятие снято: ${signedGem(-missionXp("skill"))}.`);
@@ -955,11 +1340,19 @@ function toggleSkillCompleted(index) {
   if (!skill) return;
   skill.completed = !skill.completed;
   if (skill.completed) {
+    logActivity(`skillDone:${skill.id}`, {
+      icon: "🧩",
+      title: `Умение освоено: ${skill.name}`,
+      xp: rewardValue("skillDone"),
+      daily: false,
+      bonus: true,
+    });
     state.totalXp += rewardValue("skillDone");
     showToast(`${signedGem(rewardValue("skillDone"))} в общий баланс за освоенное умение.`);
     render();
     return;
   }
+  removeActivity(`skillDone:${skill.id}`);
   state.totalXp = Math.max(0, state.totalXp - rewardValue("skillDone"));
   showToast(`Освоение снято: ${signedGem(-rewardValue("skillDone"))} из общего баланса.`);
   render();
@@ -967,6 +1360,7 @@ function toggleSkillCompleted(index) {
 
 function addSkill() {
   state.skills.push({
+    id: makeId("skill"),
     name: "Новое умение",
     goal: "Цель на лето",
     practiceDone: false,
@@ -980,10 +1374,12 @@ function deleteSkill(index) {
   const skill = state.skills[index];
   if (!skill) return;
   if (skill.practiceDone) {
+    removeActivity(`skillPractice:${skill.id}`);
     state.todayXp = Math.max(0, state.todayXp - missionXp("skill"));
     state.totalXp = Math.max(0, state.totalXp - missionXp("skill"));
   }
   if (skill.completed) {
+    removeActivity(`skillDone:${skill.id}`);
     state.totalXp = Math.max(0, state.totalXp - rewardValue("skillDone"));
   }
   state.skills.splice(index, 1);
@@ -995,13 +1391,13 @@ function deleteSkill(index) {
 }
 
 function addHardThing() {
-  state.hardThings.push({ title: "Новое сложное дело", kind: "regular", effortDone: false, completed: false, bonusXp: rewardValue("hardThingDone"), completedXpAwarded: 0 });
+  state.hardThings.push({ id: makeId("hard"), title: "Новое сложное дело", kind: "regular", effortDone: false, completed: false, bonusXp: rewardValue("hardThingDone"), completedXpAwarded: 0 });
   showToast("Сложное дело добавлено.");
   render();
 }
 
 function addBigHardThing() {
-  state.hardThings.push({ title: "Особо сложное дело", kind: "big", effortDone: false, completed: false, bonusXp: 100, completedXpAwarded: 0 });
+  state.hardThings.push({ id: makeId("hard"), title: "Особо сложное дело", kind: "big", effortDone: false, completed: false, bonusXp: 100, completedXpAwarded: 0 });
   showToast("Особо сложное дело добавлено.");
   render();
 }
@@ -1014,6 +1410,14 @@ function updateHardThingField(index, field, value) {
   const item = state.hardThings[index];
   if (!item) return;
   item[field] = field === "bonusXp" ? Math.max(0, Number(value) || 0) : value;
+  if (field === "title") {
+    syncActivityTitle(`hardEffort:${item.id}`, `Сложное дело: ${item.title}`);
+    syncActivityTitle(`hardDone:${item.id}`, `${item.kind === "big" ? "Особо сложное дело" : "Сложное дело доделано"}: ${item.title}`);
+  }
+  if (field === "bonusXp") {
+    const entry = state.activityLog?.find((activity) => activity.sourceKey === `hardDone:${item.id}`);
+    if (entry) entry.xp = hardThingCompletionXp(item);
+  }
   saveState();
 }
 
@@ -1025,10 +1429,12 @@ function removeHardThing(index) {
   const item = state.hardThings[index];
   if (!item) return;
   if (item.effortDone) {
+    removeActivity(`hardEffort:${item.id}`);
     state.todayXp = Math.max(0, state.todayXp - missionXp("hard"));
     state.totalXp = Math.max(0, state.totalXp - missionXp("hard"));
   }
   if (item.completed) state.totalXp = Math.max(0, state.totalXp - (item.completedXpAwarded || hardThingCompletionXp(item)));
+  removeActivity(`hardDone:${item.id}`);
   state.hardThings.splice(index, 1);
   const mission = state.missions.find((missionItem) => missionItem.id === "hard");
   if (mission) mission.done = state.hardThings.some((hard) => hard.effortDone);
@@ -1049,9 +1455,15 @@ function toggleHardThingEffort(index) {
   const mission = state.missions.find((missionItem) => missionItem.id === "hard");
   if (mission) mission.done = state.hardThings.some((hard) => hard.effortDone);
   if (item.effortDone) {
+    logActivity(`hardEffort:${item.id}`, {
+      icon: "🪓",
+      title: `Сложное дело: ${item.title}`,
+      xp: missionXp("hard"),
+    });
     awardXp(missionXp("hard"), `${signedGem(missionXp("hard"))} за сложное дело.`);
     return;
   }
+  removeActivity(`hardEffort:${item.id}`);
   state.todayXp = Math.max(0, state.todayXp - missionXp("hard"));
   state.totalXp = Math.max(0, state.totalXp - missionXp("hard"));
   showToast(`Сложное дело снято: ${signedGem(-missionXp("hard"))}.`);
@@ -1065,6 +1477,13 @@ function toggleHardThingCompleted(index) {
   const xp = hardThingCompletionXp(item);
   if (item.completed) {
     item.completedXpAwarded = xp;
+    logActivity(`hardDone:${item.id}`, {
+      icon: "🪓",
+      title: `${item.kind === "big" ? "Особо сложное дело" : "Сложное дело доделано"}: ${item.title}`,
+      xp,
+      daily: false,
+      bonus: true,
+    });
     state.totalXp += xp;
     showToast(`${signedGem(xp)} в общий баланс за сложное дело.`);
     render();
@@ -1072,6 +1491,7 @@ function toggleHardThingCompleted(index) {
   }
   const awardedXp = item.completedXpAwarded || xp;
   item.completedXpAwarded = 0;
+  removeActivity(`hardDone:${item.id}`);
   state.totalXp = Math.max(0, state.totalXp - awardedXp);
   showToast(`Дело снято: ${signedGem(-awardedXp)} из общего баланса.`);
   render();
@@ -1092,8 +1512,10 @@ function redeemReward(index) {
     return;
   }
   state.totalXp = Math.max(0, state.totalXp - cost);
+  const historyId = makeId("reward-history");
   state.rewardHistory = [
     {
+      id: historyId,
       title: reward.title || "Награда",
       cost,
       redeemedAt: new Date().toISOString(),
@@ -1101,6 +1523,13 @@ function redeemReward(index) {
     },
     ...(state.rewardHistory || []),
   ].slice(0, 10);
+  logActivity(`reward:${historyId}`, {
+    icon: "🎒",
+    title: `Награда: ${reward.title || "Награда"}`,
+    xp: -cost,
+    daily: false,
+    bonus: true,
+  });
   showToast(`Награда получена: ${signedGem(-cost)}.`);
   render();
 }
@@ -1109,6 +1538,7 @@ function undoReward(index) {
   const item = state.rewardHistory?.[index];
   if (!item || item.returned) return;
   item.returned = true;
+  removeActivity(`reward:${item.id}`);
   state.totalXp += Number(item.cost) || 0;
   showToast(`Алмазы возвращены: ${signedGem(Number(item.cost) || 0)}.`);
   render();
@@ -1179,6 +1609,7 @@ function updateParentPin(value) {
 function addSimpleItem(type) {
   if (type === "book") {
     state.books.push({
+      id: makeId("book"),
       title: "Новая книга",
       author: "Автор",
       status: "хочу прочитать",
@@ -1196,6 +1627,7 @@ function addSimpleItem(type) {
   }
   if (type === "video") {
     state.videos.push({
+      id: makeId("discovery"),
       title: "Новое открытие",
       source: "",
       type: "видео",
@@ -1263,8 +1695,14 @@ function toggleReadingDiary(index) {
   if (!book) return;
   book.diaryDone = !book.diaryDone;
   if (book.diaryDone) {
+    logActivity(`bookDiary:${book.id}`, {
+      icon: "📄",
+      title: `Внесено в дневник: ${book.title}`,
+      xp: rewardValue("readingDiary"),
+    });
     changeXp(rewardValue("readingDiary"), `${signedGem(rewardValue("readingDiary"))} за дневник чтения.`);
   } else {
+    removeActivity(`bookDiary:${book.id}`);
     changeXp(-rewardValue("readingDiary"), `Дневник чтения снят: ${signedGem(-rewardValue("readingDiary"))}.`);
   }
 }
@@ -1276,8 +1714,16 @@ function toggleBookRead(index) {
   book.status = book.completed ? "прочитано" : "читаю";
   if (book.completed && !book.endDate) book.endDate = TODAY_ISO;
   if (book.completed) {
+    logActivity(`bookDone:${book.id}`, {
+      icon: "📘",
+      title: `Дочитал книгу: ${book.title}`,
+      xp: rewardValue("bookDone"),
+      daily: false,
+      bonus: true,
+    });
     changeXp(rewardValue("bookDone"), `${signedGem(rewardValue("bookDone"))} за прочитанную книгу.`);
   } else {
+    removeActivity(`bookDone:${book.id}`);
     changeXp(-rewardValue("bookDone"), `Статус книги возвращён: ${signedGem(-rewardValue("bookDone"))}.`);
   }
 }
@@ -1286,10 +1732,12 @@ function deleteBook(index) {
   const book = state.books[index];
   if (!book) return;
   if (book.diaryDone) {
+    removeActivity(`bookDiary:${book.id}`);
     state.todayXp = Math.max(0, state.todayXp - rewardValue("readingDiary"));
     state.totalXp = Math.max(0, state.totalXp - rewardValue("readingDiary"));
   }
   if (book.completed) {
+    removeActivity(`bookDone:${book.id}`);
     state.todayXp = Math.max(0, state.todayXp - rewardValue("bookDone"));
     state.totalXp = Math.max(0, state.totalXp - rewardValue("bookDone"));
   }
@@ -1302,6 +1750,10 @@ function updateBookField(index, field, value) {
   const book = state.books[index];
   if (!book) return;
   book[field] = field === "pages" ? Number(value) : value;
+  if (field === "title") {
+    syncActivityTitle(`bookDiary:${book.id}`, `Внесено в дневник: ${book.title}`);
+    syncActivityTitle(`bookDone:${book.id}`, `Дочитал книгу: ${book.title}`);
+  }
   render();
 }
 
@@ -1352,6 +1804,11 @@ function updateMissionFromParent(index, field, value) {
   } else {
     mission[field] = value;
     if (field === "title") mission.customTitle = true;
+    if (field === "title") syncActivityTitle(`mission:${mission.id}`, mission.title);
+  }
+  if (field === "xp") {
+    const entry = state.activityLog?.find((item) => item.sourceKey === `mission:${mission.id}`);
+    if (entry) entry.xp = mission.xp;
   }
   saveState();
 }
@@ -1360,6 +1817,10 @@ function updateDiscovery(index, field, value) {
   const discovery = state.videos[index];
   if (!discovery) return;
   discovery[field] = value;
+  if (field === "title" || field === "type") {
+    syncActivityTitle(`discoveryViewed:${discovery.id}`, `${discovery.type === "подкаст" ? "Подкаст" : "Видео"}: ${discovery.title}`);
+    syncActivityTitle(`discoveryInsight:${discovery.id}`, `Новая находка: ${discovery.title}`);
+  }
   render();
 }
 
@@ -1367,10 +1828,12 @@ function removeDiscovery(index) {
   const discovery = state.videos[index];
   if (!discovery) return;
   if (discovery.viewedAwarded) {
+    removeActivity(`discoveryViewed:${discovery.id}`);
     state.todayXp = Math.max(0, state.todayXp - missionXp("video"));
     state.totalXp = Math.max(0, state.totalXp - missionXp("video"));
   }
   if (discovery.insightRecorded) {
+    removeActivity(`discoveryInsight:${discovery.id}`);
     state.todayXp = Math.max(0, state.todayXp - missionXp("video"));
     state.totalXp = Math.max(0, state.totalXp - missionXp("video"));
   }
@@ -1385,6 +1848,7 @@ function markDiscoveryViewed(index) {
   if (discovery.viewedAwarded) {
     discovery.viewedAwarded = false;
     discovery.status = "запланировано";
+    removeActivity(`discoveryViewed:${discovery.id}`);
     const mission = state.missions.find((item) => item.id === "video");
     if (mission) mission.done = state.videos.some((item) => item.viewedAwarded);
     state.todayXp = Math.max(0, state.todayXp - missionXp("video"));
@@ -1395,6 +1859,11 @@ function markDiscoveryViewed(index) {
   }
   discovery.status = discovery.type === "подкаст" ? "прослушано" : "просмотрено";
   discovery.viewedAwarded = true;
+  logActivity(`discoveryViewed:${discovery.id}`, {
+    icon: "🔭",
+    title: `${discovery.type === "подкаст" ? "Подкаст" : "Видео"}: ${discovery.title}`,
+    xp: missionXp("video"),
+  });
   const mission = state.missions.find((item) => item.id === "video");
   if (mission) mission.done = true;
   awardXp(missionXp("video"), `${signedGem(missionXp("video"))} за просмотр.`);
@@ -1412,6 +1881,11 @@ function recordDiscoveryInsight(index) {
     return;
   }
   discovery.insightRecorded = true;
+  logActivity(`discoveryInsight:${discovery.id}`, {
+    icon: "🔭",
+    title: `Новая находка: ${discovery.title}`,
+    xp: missionXp("video"),
+  });
   awardXp(missionXp("video"), `${signedGem(missionXp("video"))} за новую находку.`);
 }
 
@@ -1456,6 +1930,13 @@ function recalculateSurvivedNights() {
 
 function survivedNightCount(source = state) {
   return Object.values(source.calendarStatuses || {}).filter((item) => item === "survived").length;
+}
+
+function summerNightFromStart(iso = TODAY_ISO) {
+  const start = new Date("2026-05-25T12:00:00");
+  const current = new Date(`${iso}T12:00:00`);
+  const diff = Math.floor((current - start) / (24 * 60 * 60 * 1000)) + 1;
+  return Math.min(99, Math.max(1, diff));
 }
 
 function toggleManualSurvive() {
@@ -1507,13 +1988,13 @@ function returnToTrail() {
 
 function hero() {
   const status = survivalStatus();
-  const survivedCount = survivedNightCount();
+  const currentNightFromStart = summerNightFromStart();
   return `
     <section class="hero">
       <div class="topbar">
         <div class="top-stats">
           <span class="stat-chip">Накоплено <strong>${gemLabel(state.totalXp)}</strong></span>
-          <span class="stat-chip">Ночей пройдено <strong>${survivedCount} / 99</strong></span>
+          <span class="stat-chip">С начала лета <strong>${currentNightFromStart} / 99 ночей</strong></span>
           <button class="stat-chip stat-button reward-stat" onclick="setSection('Награды')">Награды</button>
         </div>
         <button class="parent-link" onclick="setSection('Родитель')">Родитель</button>
@@ -1689,13 +2170,13 @@ function mapSection() {
   const selectedIso = state.selectedCalendarDate;
   const selectedEvents = state.calendarEvents[selectedIso] || [];
   const weekDays = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
-  const survivedCount = survivedNightCount();
+  const currentNightFromStart = summerNightFromStart();
   return `
     <main class="content">
       <section class="panel full summer-map">
         <div class="panel-title">
           <h2>Карта лета</h2>
-          <span class="mini-chip">25 мая — 31 августа · ровно 99 ночей · 🏕️ ${survivedCount} ночей пройдено</span>
+          <span class="mini-chip">25 мая — 31 августа · сейчас ночь ${currentNightFromStart} из 99</span>
         </div>
 
         <div class="calendar-layout calendar-only">
@@ -1875,7 +2356,7 @@ function readingSection() {
               <div><span>Начал читать</span><input type="date" value="${book.startDate || ""}" onchange="updateBookField(${index}, 'startDate', this.value)" /></div>
               <div><span>Закончил</span><input type="date" value="${book.endDate || ""}" onchange="updateBookField(${index}, 'endDate', this.value)" /></div>
             </div>
-            <div class="reading-actions ${item.kind === "big" ? "single-action" : ""}">
+            <div class="reading-actions">
               <button class="reading-toggle ${book.diaryDone ? "active" : ""}" onclick="toggleReadingDiary(${index})">
                 <span>${book.diaryDone ? "✓ Дневник чтения" : "Дневник чтения"}</span>
                 <strong>${book.diaryDone ? signedGem(rewardValue("readingDiary")) : `даёт ${signedGem(rewardValue("readingDiary"))}`}</strong>
@@ -2086,26 +2567,9 @@ function weeklySection() {
 
 function daySummarySection() {
   const status = survivalStatus();
-  const doneMissions = state.missions.filter((mission) => mission.done && !["skill", "hard", "role", "video"].includes(mission.id));
-  const skillPractices = (state.skills || []).filter((skill) => skill.practiceDone);
-  const completedSkills = (state.skills || []).filter((skill) => skill.completed);
-  const hardEfforts = (state.hardThings || []).filter((item) => item.effortDone);
-  const hardCompleted = (state.hardThings || []).filter((item) => item.completed);
-  const homeTasks = (state.roles || []).filter((role) => role.done);
-  const completedBooks = (state.books || []).filter((book) => book.completed || book.status === "прочитано");
-  const todayRewards = (state.rewardHistory || []).filter((item) => !item.returned && item.redeemedAt?.slice(0, 10) === TODAY_ISO);
-  const dayRows = [
-    ...doneMissions.map((mission) => [`${mission.icon} ${mission.title}`, signedGem(mission.xp)]),
-    ...skillPractices.map((skill) => [`🧩 Новое умение: ${skill.name}`, signedGem(missionXp("skill"))]),
-    ...hardEfforts.map((item) => [`🪓 Сложное дело: ${item.title}`, signedGem(missionXp("hard"))]),
-    ...homeTasks.map((role) => [`🏕️ Помощь по дому: ${role.title}`, signedGem(role.xp || 5)]),
-    ...todayRewards.map((item) => [`🎒 Награда: ${item.title}`, signedGem(-item.cost)]),
-  ];
-  const bonusRows = [
-    ...completedBooks.map((book) => [`📄 Дочитал книгу: ${book.title}`, signedGem(rewardValue("bookDone"))]),
-    ...completedSkills.map((skill) => [`🧩 Умение освоено: ${skill.name}`, signedGem(rewardValue("skillDone"))]),
-    ...hardCompleted.map((item) => [`🪓 ${item.kind === "big" ? "Особо сложное дело" : "Сложное дело доделано"}: ${item.title}`, signedGem(hardThingCompletionXp(item))]),
-  ];
+  const todayEntries = (state.activityLog || []).filter((item) => item.date === TODAY_ISO);
+  const dayRows = todayEntries.filter((item) => item.daily);
+  const bonusRows = todayEntries.filter((item) => !item.daily);
   return `
     <main class="content">
       <section class="panel full">
@@ -2116,11 +2580,11 @@ function daySummarySection() {
           <div class="metric"><span>Осталось до костра</span><strong>${gemLabel(xpLeft())}</strong></div>
         </div>
         <div class="summary-list day-summary-list">
-          ${dayRows.length ? dayRows.map(([title, value]) => `<div class="summary-item"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("") : `<div class="empty-state">Сегодня пока ничего не отмечено.</div>`}
+          ${dayRows.length ? dayRows.map((item) => `<div class="summary-item"><strong>${escapeHtml(activityTitle(item))}</strong><span>${escapeHtml(signedGem(item.xp))}</span></div>`).join("") : `<div class="empty-state">Сегодня пока ничего не отмечено.</div>`}
         </div>
         ${bonusRows.length ? `
           <div class="panel-title inline-title"><h2>Бонусы дня</h2><span class="mini-chip">в общий баланс</span></div>
-          <div class="summary-list">${bonusRows.map(([title, value]) => `<div class="summary-item bonus"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(value)}</span></div>`).join("")}</div>
+          <div class="summary-list">${bonusRows.map((item) => `<div class="summary-item bonus"><strong>${escapeHtml(activityTitle(item))}</strong><span>${escapeHtml(signedGem(item.xp))}</span></div>`).join("")}</div>
         ` : ""}
       </section>
     </main>
@@ -2128,34 +2592,55 @@ function daySummarySection() {
 }
 
 function allTimeSummarySection() {
-  const survivedCount = survivedNightCount();
-  const completedBooks = (state.books || []).filter((book) => book.completed || book.status === "прочитано");
-  const completedPages = completedBooks.reduce((sum, book) => sum + (Number(book.pages) || 0), 0);
-  const diaryCount = (state.books || []).filter((book) => book.diaryDone).length;
-  const skillPracticeCount = (state.skills || []).filter((skill) => skill.practiceDone).length;
-  const completedSkills = (state.skills || []).filter((skill) => skill.completed);
-  const hardEffortCount = (state.hardThings || []).filter((item) => item.effortDone).length;
-  const hardCompleted = (state.hardThings || []).filter((item) => item.completed);
-  const homeDone = (state.roles || []).filter((role) => role.done);
+  const currentNightFromStart = summerNightFromStart();
   const rewardSpent = (state.rewardHistory || []).filter((item) => !item.returned).reduce((sum, item) => sum + (Number(item.cost) || 0), 0);
-  const named = (items, field = "title") => items.map((item) => escapeHtml(item[field] || item.name)).join(", ") || "пока нет";
+  const entries = [...(state.activityLog || [])].sort((a, b) => `${b.date}-${b.id}`.localeCompare(`${a.date}-${a.id}`));
+  const grouped = entries.reduce((map, item) => {
+    if (!map.has(item.date)) map.set(item.date, []);
+    map.get(item.date).push(item);
+    return map;
+  }, new Map());
+  const totalActivities = entries.length;
+  const dailyActivities = entries.filter((item) => item.daily).length;
   return `
     <main class="content">
       <section class="panel full">
         <div class="panel-title"><h2>Итог за всё время</h2><span class="mini-chip">${gemLabel(state.totalXp)} сейчас</span></div>
         <div class="day-summary-top">
-          <div class="metric"><span>Ночей пройдено</span><strong>${survivedCount} / 99</strong></div>
-          <div class="metric"><span>Алмазов накоплено</span><strong>${gemLabel(state.totalXp)}</strong></div>
+          <div class="metric"><span>Ночей с начала</span><strong>${currentNightFromStart} / 99</strong></div>
+          <div class="metric"><span>Активностей отмечено</span><strong>${totalActivities}</strong></div>
           <div class="metric"><span>Потрачено на награды</span><strong>${gemLabel(rewardSpent)}</strong></div>
         </div>
-        <div class="summary-list">
-          <div class="summary-item"><strong>📘 Книги прочитаны</strong><span>${completedBooks.length} книг · ${completedPages} страниц</span></div>
-          <div class="summary-item"><strong>📄 Внесено в дневник чтения</strong><span>${diaryCount} записей</span></div>
-          <div class="summary-item"><strong>🧩 Занятия по умениям</strong><span>${skillPracticeCount} раз</span></div>
-          <div class="summary-item"><strong>🧩 Умения освоены</strong><span>${named(completedSkills, "name")}</span></div>
-          <div class="summary-item"><strong>🪓 Сложные дела 15 минут</strong><span>${hardEffortCount} раз</span></div>
-          <div class="summary-item"><strong>🪓 Сложные дела доделаны</strong><span>${named(hardCompleted)}</span></div>
-          <div class="summary-item"><strong>🏕️ Помощь по дому</strong><span>${homeDone.length} дел: ${named(homeDone)}</span></div>
+        <div class="summary-strip">
+          <span class="mini-chip">Миссий дня: ${dailyActivities}</span>
+          <span class="mini-chip">Бонусов: ${totalActivities - dailyActivities}</span>
+        </div>
+        <div class="activity-timeline compact">
+          ${grouped.size ? Array.from(grouped.entries()).map(([date, dayEntries]) => {
+            const dayXp = dayEntries.reduce((sum, item) => sum + (Number(item.xp) || 0), 0);
+            return `
+              <article class="activity-day-card compact">
+                <div class="activity-day-head">
+                  <strong>${formatDateRu(date)}</strong>
+                  <span class="mini-chip">${signedGem(dayXp)}</span>
+                </div>
+                <div class="activity-lines">
+                  ${dayEntries.map((item) => `
+                    <div class="activity-line ${item.bonus ? "bonus" : ""}">
+                      <span class="activity-line-title">${escapeHtml(activityTitle(item))}</span>
+                      <span class="activity-line-xp">${escapeHtml(signedGem(item.xp))}</span>
+                      ${state.parentUnlocked ? `
+                        <div class="activity-edit-controls">
+                          <input type="date" min="2026-05-25" max="2026-08-31" value="${item.date || TODAY_ISO}" onchange="updateActivityDate('${item.id}', this.value)" />
+                          <button class="icon-btn" title="Удалить запись" onclick="deleteActivityEntry('${item.id}')">×</button>
+                        </div>
+                      ` : ""}
+                    </div>
+                  `).join("")}
+                </div>
+              </article>
+            `;
+          }).join("") : `<div class="empty-state">Пока нет записанных активностей. Когда Андрей нажмёт «Сделал», они появятся здесь по дням.</div>`}
         </div>
       </section>
     </main>
@@ -2194,6 +2679,7 @@ function parentSection() {
   ];
   const manualDate = state.parentManualDate || TODAY_ISO;
   const manualDateSurvived = state.calendarStatuses?.[manualDate] === "survived";
+  const activityRows = [...(state.activityLog || [])].sort((a, b) => `${b.date}-${b.id}`.localeCompare(`${a.date}-${a.id}`));
   const syncStatus = supabaseSync.enabled
     ? (supabaseSync.lastSavedAt ? `Supabase: сохранено ${supabaseSync.lastSavedAt}` : "Supabase: подключён")
     : "Supabase: не настроен";
@@ -2319,6 +2805,20 @@ function parentSection() {
                 </div>
               </div>
               <button class="${manualDateSurvived ? "secondary-btn" : "primary-btn"}" onclick="toggleManualSurvive()">${manualDateSurvived ? "Отменить зачёт" : "Отметить ночь как выжившую"}</button>
+            </div>
+            <div class="field">
+              <label>Даты активностей</label>
+              <div class="parent-activity-list">
+                ${activityRows.length ? activityRows.map((item) => `
+                  <div class="parent-activity-row">
+                    <div>
+                      <strong>${escapeHtml(activityTitle(item))}</strong>
+                      <span>${escapeHtml(signedGem(item.xp))} · ${item.daily ? "миссия дня" : "бонус"}</span>
+                    </div>
+                    <input type="date" min="2026-05-25" max="2026-08-31" value="${item.date || TODAY_ISO}" onchange="updateActivityDate('${item.id}', this.value)" />
+                  </div>
+                `).join("") : `<div class="empty-state">Пока нет активностей. Когда Андрей что-то отметит, здесь можно будет поменять дату.</div>`}
+              </div>
             </div>
           </div>
           <div class="row">

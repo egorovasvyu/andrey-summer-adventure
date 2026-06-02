@@ -1430,6 +1430,20 @@ textarea {
   border-color: rgba(255, 220, 162, 0.2);
 }
 
+.activity-edit-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.activity-edit-controls input {
+  width: 150px;
+  min-height: 36px;
+  padding: 8px;
+  font-size: 0.86rem;
+}
+
 .day-summary-top {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1439,6 +1453,109 @@ textarea {
 
 .day-summary-list {
   margin-top: 10px;
+}
+
+.summary-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 16px;
+}
+
+.activity-timeline.compact {
+  display: grid;
+  gap: 8px;
+}
+
+.activity-day-card.compact {
+  display: grid;
+  overflow: hidden;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 220, 162, 0.14);
+  background: rgba(7, 17, 16, 0.58);
+}
+
+.activity-day-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  background: rgba(255, 184, 88, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.075);
+}
+
+.activity-day-head strong {
+  color: var(--paper);
+  font-size: 0.93rem;
+  line-height: 1.2;
+}
+
+.activity-lines {
+  display: grid;
+}
+
+.activity-line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  min-height: 38px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+}
+
+.activity-line:last-child {
+  border-bottom: 0;
+}
+
+.activity-line.bonus {
+  background: rgba(255, 184, 88, 0.055);
+}
+
+.activity-line-title {
+  color: var(--text);
+  font-weight: 850;
+  min-width: 0;
+}
+
+.activity-line-xp {
+  color: #8ee9ff;
+  font-weight: 950;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.parent-activity-list {
+  display: grid;
+  gap: 10px;
+}
+
+.parent-activity-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 170px;
+  gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.055);
+}
+
+.parent-activity-row strong,
+.parent-activity-row span {
+  display: block;
+}
+
+.parent-activity-row strong {
+  color: var(--paper);
+}
+
+.parent-activity-row span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  font-weight: 800;
 }
 
 .reward-card {
@@ -1630,6 +1747,15 @@ textarea {
 
   .day-summary-top {
     grid-template-columns: 1fr;
+  }
+
+  .activity-line {
+    grid-template-columns: minmax(0, 1fr) 70px;
+  }
+
+  .activity-edit-controls {
+    grid-column: 1 / -1;
+    margin-left: 0;
   }
 
   .field-pair,
